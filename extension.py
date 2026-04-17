@@ -2,19 +2,25 @@ from __future__ import annotations
 
 import hashlib
 import io as stdlib_io
+import json
+import struct
 from typing import Any
 
 import av
+import folder_paths
 import node_helpers
 import numpy as np
 import torch
 from aiohttp import web
 from PIL import Image, ImageOps, ImageSequence
+from protocol import BinaryEventTypes
 from server import PromptServer
 from typing_extensions import override
 
 import comfy.model_management
-from comfy_api.latest import ComfyExtension, InputImpl, io
+from comfy.cli_args import args
+from comfy_api.latest import ComfyExtension, Input, InputImpl, Types, io
+from comfy_execution.utils import get_executing_context
 
 from .media_registry import (
     MediaItem,
@@ -67,6 +73,98 @@ def _get_media_item(media_id: str, *, expected_kind: str | None = None) -> Media
             f"Media id '{media_id}' has kind '{item.kind}', expected '{expected_kind}'"
         )
     return item
+
+
+def _get_client_id() -> str | None:
+    client_id = getattr(PromptServer.instance, "client_id", None)
+    if isinstance(client_id, str) and client_id.strip():
+        return client_id
+    return None
+
+
+def _get_execution_ids() -> tuple[str | None, str | None]:
+    context = get_executing_context()
+    if context is None:
+        return None, None
+    return context.node_id, context.prompt_id
+
+
+def _send_progress_update(
+    value: float,
+    max_value: float,
+    *,
+    node_id: str | None,
+    prompt_id: str | None,
+) -> None:
+    client_id = _get_client_id()
+    if client_id is None:
+        return
+
+    progress = {"value": value, "max": max_value}
+    if prompt_id is not None:
+        progress["prompt_id"] = prompt_id
+    if node_id is not None:
+        progress["node"] = node_id
+
+    PromptServer.instance.send_sync("progress", progress, sid=client_id)
+
+
+def _send_binary_event(event: int, payload: bytes) -> None:
+    client_id = _get_client_id()
+    if client_id is None:
+        return
+    PromptServer.instance.send_sync(event, payload, sid=client_id)
+
+
+def _encode_payload_with_metadata(payload: bytes, metadata: dict[str, Any]) -> bytes:
+    metadata_json = json.dumps(metadata).encode("utf-8")
+    return struct.pack(">I", len(metadata_json)) + metadata_json + payload
+
+
+def _tensor_to_pil_rgb_image(image: torch.Tensor) -> Image.Image:
+    image_rgb = (
+        torch.clamp(image[..., :3] * 255.0, min=0, max=255)
+        .to(device=torch.device("cpu"), dtype=torch.uint8)
+        .numpy()
+    )
+    return Image.fromarray(np.ascontiguousarray(image_rgb), mode="RGB")
+
+
+def _build_saved_video_metadata(node_cls: type[io.ComfyNode]) -> dict[str, Any] | None:
+    if args.disable_metadata:
+        return None
+
+    metadata: dict[str, Any] = {}
+    if node_cls.hidden.extra_pnginfo is not None:
+        metadata.update(node_cls.hidden.extra_pnginfo)
+    if node_cls.hidden.prompt is not None:
+        metadata["prompt"] = node_cls.hidden.prompt
+    return metadata or None
+
+
+def _resolve_video_content_type(format_value: Types.VideoContainer | str) -> str:
+    if isinstance(format_value, Types.VideoContainer):
+        container = format_value
+    else:
+        container = Types.VideoContainer(format_value)
+
+    if container in (Types.VideoContainer.AUTO, Types.VideoContainer.MP4):
+        return "video/mp4"
+    return "application/octet-stream"
+
+
+def _build_memory_output_item(
+    item: MediaItem,
+    *,
+    subfolder: str = "",
+) -> dict[str, Any]:
+    return {
+        "filename": item.filename,
+        "subfolder": subfolder,
+        "type": "output",
+        "content_type": item.content_type,
+        "view_url": f"/api/vlo-memory/view/{item.media_id}",
+    }
 
 
 def _load_image_from_bytes(data: bytes) -> tuple[torch.Tensor, torch.Tensor]:
@@ -431,6 +529,149 @@ class VLOMemoryLoadVideo(io.ComfyNode):
         return True
 
 
+class VLOSaveImageWebsocketBMP(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="VLOSaveImageWebsocketBMP",
+            search_aliases=["bmp websocket", "save image websocket bmp"],
+            display_name="VLO Save Image Websocket (BMP)",
+            category="api/image",
+            description=(
+                "Streams full-size images to the websocket as BMP payloads. "
+                "This avoids PNG encode time at the cost of larger payloads."
+            ),
+            inputs=[
+                io.Image.Input(
+                    "images",
+                    tooltip="The image batch to stream to the websocket as BMP.",
+                )
+            ],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(cls, images: Input.Image) -> io.NodeOutput:
+        total_images = int(images.shape[0]) if hasattr(images, "shape") else len(images)
+        if total_images <= 0:
+            return io.NodeOutput()
+
+        node_id, prompt_id = _get_execution_ids()
+
+        for step, image in enumerate(images, start=1):
+            pil_image = _tensor_to_pil_rgb_image(image)
+            buffer = stdlib_io.BytesIO()
+            pil_image.save(buffer, format="BMP")
+            preview_metadata: dict[str, Any] = {"image_type": "image/bmp"}
+            if node_id is not None:
+                preview_metadata["node_id"] = node_id
+            if prompt_id is not None:
+                preview_metadata["prompt_id"] = prompt_id
+            preview_payload = _encode_payload_with_metadata(
+                buffer.getvalue(),
+                preview_metadata,
+            )
+            _send_progress_update(
+                step,
+                total_images,
+                node_id=node_id,
+                prompt_id=prompt_id,
+            )
+            _send_binary_event(
+                BinaryEventTypes.PREVIEW_IMAGE_WITH_METADATA,
+                preview_payload,
+            )
+
+        return io.NodeOutput()
+
+
+class VLOSaveVideoWebsocket(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="VLOSaveVideoWebsocket",
+            search_aliases=["export video websocket", "save video websocket"],
+            display_name="VLO Save Video Websocket",
+            category="api/video",
+            description=(
+                "Stores the input video in VLO memory and emits a websocket result "
+                "entry so the frontend can fetch it immediately without saving to disk."
+            ),
+            inputs=[
+                io.Video.Input("video", tooltip="The video to expose to the frontend."),
+                io.String.Input(
+                    "filename_prefix",
+                    default="video/ComfyUI",
+                    tooltip=(
+                        "The filename prefix to use for the in-memory video result. "
+                        "Formatting tokens follow the same rules as Save Video."
+                    ),
+                ),
+                io.Combo.Input(
+                    "format",
+                    options=Types.VideoContainer.as_input(),
+                    default="auto",
+                    tooltip="The container format to use for the emitted video.",
+                ),
+                io.Combo.Input(
+                    "codec",
+                    options=Types.VideoCodec.as_input(),
+                    default="auto",
+                    tooltip="The codec to use for the emitted video.",
+                ),
+            ],
+            hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo],
+            is_output_node=True,
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        video: Input.Video,
+        filename_prefix: str,
+        format: str,
+        codec: str,
+    ) -> io.NodeOutput:
+        width, height = video.get_dimensions()
+        _, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
+            filename_prefix,
+            folder_paths.get_output_directory(),
+            width,
+            height,
+        )
+
+        container_format = Types.VideoContainer(format)
+        video_codec = Types.VideoCodec(codec)
+        file = (
+            f"{filename}_{counter:05}_."
+            f"{Types.VideoContainer.get_extension(container_format)}"
+        )
+
+        buffer = stdlib_io.BytesIO()
+        video.save_to(
+            buffer,
+            format=container_format,
+            codec=video_codec,
+            metadata=_build_saved_video_metadata(cls),
+        )
+
+        item = REGISTRY.register(
+            kind="video",
+            filename=file,
+            content_type=_resolve_video_content_type(container_format),
+            data=buffer.getvalue(),
+            client_id=_get_client_id(),
+        )
+
+        return io.NodeOutput(
+            ui={
+                "videos": [
+                    _build_memory_output_item(item, subfolder=subfolder),
+                ]
+            }
+        )
+
+
 class LTXSetAudioLatentBinaryMasks(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -542,6 +783,8 @@ class VLOMemoryLoaderExtension(ComfyExtension):
             VLOMemoryLoadImage,
             VLOMemoryLoadAudio,
             VLOMemoryLoadVideo,
+            VLOSaveImageWebsocketBMP,
+            VLOSaveVideoWebsocket,
             LTXSetAudioLatentBinaryMasks,
         ]
 
