@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io as stdlib_io
 import json
+import logging
 import struct
 from typing import Any
 
@@ -31,6 +32,7 @@ from .media_registry import (
 
 
 REGISTRY = MediaRegistry()
+logger = logging.getLogger(__name__)
 _DEFAULT_CONTENT_TYPES = {
     "image": "image/png",
     "video": "video/mp4",
@@ -390,7 +392,15 @@ async def view_memory_media(request: web.Request) -> web.Response:
     media_id = request.match_info.get("media_id", "")
     item = REGISTRY.get(media_id)
     if item is None:
+        logger.warning("VLO memory media not found: media_id=%s", media_id)
         return _json_error(404, "Unknown media id")
+    logger.debug(
+        "VLO memory media served: media_id=%s filename=%s content_type=%s size_bytes=%s",
+        media_id,
+        item.filename,
+        item.content_type,
+        item.size_bytes,
+    )
     return web.Response(
         body=item.data,
         content_type=item.content_type,
@@ -661,6 +671,18 @@ class VLOSaveVideoWebsocket(io.ComfyNode):
             content_type=_resolve_video_content_type(container_format),
             data=buffer.getvalue(),
             client_id=_get_client_id(),
+        )
+        node_id, prompt_id = _get_execution_ids()
+        logger.info(
+            "Registered VLO websocket video output: media_id=%s filename=%s subfolder=%s content_type=%s size_bytes=%s client_id=%s node_id=%s prompt_id=%s",
+            item.media_id,
+            item.filename,
+            subfolder,
+            item.content_type,
+            item.size_bytes,
+            item.client_id,
+            node_id,
+            prompt_id,
         )
 
         return io.NodeOutput(
