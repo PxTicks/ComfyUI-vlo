@@ -825,12 +825,17 @@ class VLOLatentCompositeMasked(io.ComfyNode):
                     default=False,
                     tooltip="If true, removes the noise_mask from the output latent after compositing.",
                 ),
+                io.Boolean.Input(
+                    "force_binary_mask",
+                    default=False,
+                    tooltip="If true, applies a 0.5 threshold to the mask to prevent continuous blending at the edges.",
+                ),
             ],
             outputs=[io.Latent.Output()],
         )
 
     @classmethod
-    def execute(cls, destination, source, clear_mask=False) -> io.NodeOutput:
+    def execute(cls, destination, source, clear_mask=False, force_binary_mask=False) -> io.NodeOutput:
         dest_samples = destination["samples"]
         src_samples = source["samples"]
 
@@ -842,6 +847,9 @@ class VLOLatentCompositeMasked(io.ComfyNode):
             return io.NodeOutput(output)
 
         mask = mask.to(dtype=dest_samples.dtype, device=dest_samples.device)
+
+        if force_binary_mask:
+            mask = (mask >= 0.5).to(dtype=mask.dtype)
 
         try:
             output["samples"] = src_samples * mask + dest_samples * (1.0 - mask)
