@@ -798,6 +798,66 @@ class LTXSetAudioLatentBinaryMasks(io.ComfyNode):
         return io.NodeOutput(output)
 
 
+class VLOLatentCompositeMasked(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="VLOLatentCompositeMasked",
+            search_aliases=["vlo composite latent", "vlo inpaint latent"],
+            display_name="VLO Latent Composite Masked",
+            category="latent/composite",
+            description=(
+                "Composites a source latent into a destination latent using "
+                "the destination's existing noise_mask. The mask dictates where the "
+                "source replaces the destination."
+            ),
+            inputs=[
+                io.Latent.Input(
+                    "destination",
+                    tooltip="The destination latent. Should have an existing noise_mask.",
+                ),
+                io.Latent.Input(
+                    "source",
+                    tooltip="The source latent patches to composite into the destination.",
+                ),
+                io.Boolean.Input(
+                    "clear_mask",
+                    default=False,
+                    tooltip="If true, removes the noise_mask from the output latent after compositing.",
+                ),
+            ],
+            outputs=[io.Latent.Output()],
+        )
+
+    @classmethod
+    def execute(cls, destination, source, clear_mask=False) -> io.NodeOutput:
+        dest_samples = destination["samples"]
+        src_samples = source["samples"]
+
+        output = destination.copy()
+        output["samples"] = dest_samples.clone()
+
+        mask = destination.get("noise_mask")
+        if mask is None:
+            return io.NodeOutput(output)
+
+        mask = mask.to(dtype=dest_samples.dtype, device=dest_samples.device)
+
+        try:
+            output["samples"] = src_samples * mask + dest_samples * (1.0 - mask)
+        except RuntimeError as e:
+            raise ValueError(
+                f"Could not composite: destination {tuple(dest_samples.shape)}, "
+                f"source {tuple(src_samples.shape)}, mask {tuple(mask.shape)} "
+                f"are not broadcast-compatible. Ensure the mask is preshaped for this latent."
+            ) from e
+
+        if clear_mask:
+            output.pop("noise_mask", None)
+
+        return io.NodeOutput(output)
+
+
 class VLOMemoryLoaderExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
@@ -808,6 +868,7 @@ class VLOMemoryLoaderExtension(ComfyExtension):
             VLOSaveImageWebsocketBMP,
             VLOSaveVideoWebsocket,
             LTXSetAudioLatentBinaryMasks,
+            VLOLatentCompositeMasked,
         ]
 
 
