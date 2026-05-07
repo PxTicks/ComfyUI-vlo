@@ -4,7 +4,9 @@ import hashlib
 import io as stdlib_io
 import json
 import logging
+import math
 import struct
+from fractions import Fraction
 from typing import Any
 
 import av
@@ -334,6 +336,57 @@ def _build_audio_binary_noise_mask(
     ).clone()
 
 
+def _coerce_positive_fps(value: float) -> Fraction:
+    if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise ValueError(f"FPS must be a positive finite number, got {value!r}")
+    return Fraction(round(float(value) * 1000), 1000)
+
+
+def _resample_video_frames_to_fps(
+    video: Input.Video,
+    *,
+    target_fps: float,
+) -> Input.Video:
+    components = video.get_components()
+    source_images = components.images
+    source_frame_count = int(source_images.shape[0])
+    if source_frame_count <= 0:
+        raise ValueError("Video must contain at least one frame to resample FPS.")
+
+    source_fps = Fraction(components.frame_rate)
+    if source_fps <= 0:
+        raise ValueError(
+            f"Video must have a positive frame rate, got {components.frame_rate!r}"
+        )
+
+    target_frame_rate = _coerce_positive_fps(target_fps)
+    if target_frame_rate == source_fps:
+        return video
+
+    # Match the frontend exporter closely: preserve the clip duration coverage by
+    # rounding the frame count up to the next target-fps boundary, then sample the
+    # nearest source frame for each target timestamp. This duplicates or drops
+    # frames, but never blends them, which keeps binary mask mattes crisp.
+    duration_seconds = source_frame_count / float(source_fps)
+    target_frame_count = max(1, int(math.ceil(duration_seconds * float(target_frame_rate))))
+    target_timestamps = torch.arange(target_frame_count, dtype=torch.float64)
+    target_timestamps /= float(target_frame_rate)
+    source_indices = torch.round(target_timestamps * float(source_fps)).to(
+        dtype=torch.long
+    )
+    source_indices = source_indices.clamp(0, source_frame_count - 1)
+
+    resampled_images = source_images.index_select(0, source_indices.to(source_images.device))
+    return InputImpl.VideoFromComponents(
+        Types.VideoComponents(
+            images=resampled_images,
+            audio=components.audio,
+            frame_rate=target_frame_rate,
+            metadata=components.metadata,
+        )
+    )
+
+
 @PromptServer.instance.routes.post("/api/vlo-memory/register")
 async def register_memory_media(request: web.Request) -> web.Response:
     post_data = await request.post()
@@ -537,6 +590,49 @@ class VLOMemoryLoadVideo(io.ComfyNode):
         if REGISTRY.get(file, mark_accessed=False) is None:
             return f"Invalid video id: {file}"
         return True
+
+
+class VLOVideoConvertFps(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="VLOVideoConvertFps",
+            search_aliases=[
+                "convert video fps",
+                "resample video fps",
+                "retime video fps",
+                "change video fps",
+            ],
+            display_name="VLO Video Convert FPS",
+            category="image/video",
+            description=(
+                "Resamples a video to a target FPS while preserving audio and overall clip "
+                "coverage. Frames are duplicated or dropped using nearest-frame temporal "
+                "sampling; no frame blending is applied."
+            ),
+            inputs=[
+                io.Video.Input(
+                    "video",
+                    tooltip="The source video to retime.",
+                ),
+                io.Float.Input(
+                    "fps",
+                    default=25.0,
+                    min=0.01,
+                    max=1000.0,
+                    step=0.01,
+                    tooltip=(
+                        "Target frames per second. Duration is preserved approximately by "
+                        "duplicating or dropping frames rather than changing playback speed."
+                    ),
+                ),
+            ],
+            outputs=[io.Video.Output()],
+        )
+
+    @classmethod
+    def execute(cls, video: Input.Video, fps: float) -> io.NodeOutput:
+        return io.NodeOutput(_resample_video_frames_to_fps(video, target_fps=fps))
 
 
 class VLOSaveImageWebsocketBMP(io.ComfyNode):
@@ -873,6 +969,7 @@ class VLOMemoryLoaderExtension(ComfyExtension):
             VLOMemoryLoadImage,
             VLOMemoryLoadAudio,
             VLOMemoryLoadVideo,
+            VLOVideoConvertFps,
             VLOSaveImageWebsocketBMP,
             VLOSaveVideoWebsocket,
             LTXSetAudioLatentBinaryMasks,
