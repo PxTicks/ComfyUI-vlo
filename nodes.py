@@ -962,7 +962,7 @@ class VLOLatentCompositeMasked(io.ComfyNode):
         return io.NodeOutput(output)
 
 
-class VLOMemoryLoaderExtension(ComfyExtension):
+class VLOExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
@@ -977,5 +977,5 @@ class VLOMemoryLoaderExtension(ComfyExtension):
         ]
 
 
-async def comfy_entrypoint() -> VLOMemoryLoaderExtension:
-    return VLOMemoryLoaderExtension()
+async def comfy_entrypoint() -> VLOExtension:
+    return VLOExtension()
