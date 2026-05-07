@@ -962,6 +962,44 @@ class VLOLatentCompositeMasked(io.ComfyNode):
         return io.NodeOutput(output)
 
 
+class VLOGateNone(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        template = io.MatchType.Template("value")
+        return io.Schema(
+            node_id="VLOGateNone",
+            search_aliases=["gate", "null gate", "disable pass-through"],
+            display_name="VLO Gate None",
+            category="utils/logic",
+            description=(
+                "Passes any connected value through unchanged unless disabled is true, "
+                "in which case the output is None."
+            ),
+            inputs=[
+                io.MatchType.Input(
+                    "value",
+                    template=template,
+                    tooltip="Any connected value to pass through or suppress.",
+                ),
+                io.Boolean.Input(
+                    "disabled",
+                    default=False,
+                    tooltip="When true, suppresses the value and outputs None instead.",
+                ),
+            ],
+            outputs=[
+                io.MatchType.Output(
+                    template=template,
+                    display_name="value",
+                )
+            ],
+        )
+
+    @classmethod
+    def execute(cls, value, disabled=False) -> io.NodeOutput:
+        return io.NodeOutput(None if disabled else value)
+
+
 class VLOExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
@@ -974,6 +1012,7 @@ class VLOExtension(ComfyExtension):
             VLOSaveVideoWebsocket,
             LTXSetAudioLatentBinaryMasks,
             VLOLatentCompositeMasked,
+            VLOGate,
         ]
 
 
