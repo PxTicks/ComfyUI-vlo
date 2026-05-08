@@ -968,7 +968,7 @@ class VLOGateNone(io.ComfyNode):
         template = io.MatchType.Template("value")
         return io.Schema(
             node_id="VLOGateNone",
-            search_aliases=["gate", "null gate", "disable pass-through"],
+            search_aliases=["gate", "null gate", "disable pass-through", "none gate"],
             display_name="VLO Gate None",
             category="utils/logic",
             description=(
@@ -1012,7 +1012,7 @@ class VLOExtension(ComfyExtension):
             VLOSaveVideoWebsocket,
             LTXSetAudioLatentBinaryMasks,
             VLOLatentCompositeMasked,
-            VLOGate,
+            VLOGateNone,
         ]
 
 
