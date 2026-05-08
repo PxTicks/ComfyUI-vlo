@@ -40,6 +40,7 @@ _DEFAULT_CONTENT_TYPES = {
     "video": "video/mp4",
     "audio": "audio/wav",
 }
+_UI_PLACEHOLDER_MEDIA_IDS = frozenset({"loading..."})
 
 
 def _json_error(status: int, message: str) -> web.Response:
@@ -69,14 +70,30 @@ def _media_summary(item: MediaItem) -> dict[str, Any]:
 
 
 def _get_media_item(media_id: str, *, expected_kind: str | None = None) -> MediaItem:
-    item = REGISTRY.get(media_id)
+    normalized_media_id = _normalize_media_id(media_id)
+    if normalized_media_id is None:
+        expected_label = expected_kind or "media"
+        raise ValueError(f"No {expected_label} selected")
+
+    item = REGISTRY.get(normalized_media_id)
     if item is None:
-        raise ValueError(f"Unknown media id: {media_id}")
+        raise ValueError(f"Unknown media id: {normalized_media_id}")
     if expected_kind is not None and item.kind != expected_kind:
         raise ValueError(
-            f"Media id '{media_id}' has kind '{item.kind}', expected '{expected_kind}'"
+            f"Media id '{normalized_media_id}' has kind '{item.kind}', expected '{expected_kind}'"
         )
     return item
+
+
+def _normalize_media_id(raw_media_id: Any) -> str | None:
+    if not isinstance(raw_media_id, str):
+        return None
+    media_id = raw_media_id.strip()
+    if not media_id:
+        return None
+    if media_id.lower() in _UI_PLACEHOLDER_MEDIA_IDS:
+        return None
+    return media_id
 
 
 def _get_client_id() -> str | None:
@@ -499,14 +516,20 @@ class VLOMemoryLoadImage(io.ComfyNode):
 
     @classmethod
     def fingerprint_inputs(cls, image):
-        item = REGISTRY.get(image, mark_accessed=False)
+        normalized_image = _normalize_media_id(image)
+        if normalized_image is None:
+            return "__unset__"
+        item = REGISTRY.get(normalized_image, mark_accessed=False)
         if item is None:
-            return image
+            return normalized_image
         return hashlib.sha256(item.data).hexdigest()
 
     @classmethod
     def validate_inputs(cls, image):
-        if REGISTRY.get(image, mark_accessed=False) is None:
+        normalized_image = _normalize_media_id(image)
+        if normalized_image is None:
+            return True
+        if REGISTRY.get(normalized_image, mark_accessed=False) is None:
             return f"Invalid image id: {image}"
         return True
 
@@ -540,14 +563,20 @@ class VLOMemoryLoadAudio(io.ComfyNode):
 
     @classmethod
     def fingerprint_inputs(cls, audio):
-        item = REGISTRY.get(audio, mark_accessed=False)
+        normalized_audio = _normalize_media_id(audio)
+        if normalized_audio is None:
+            return "__unset__"
+        item = REGISTRY.get(normalized_audio, mark_accessed=False)
         if item is None:
-            return audio
+            return normalized_audio
         return hashlib.sha256(item.data).hexdigest()
 
     @classmethod
     def validate_inputs(cls, audio):
-        if REGISTRY.get(audio, mark_accessed=False) is None:
+        normalized_audio = _normalize_media_id(audio)
+        if normalized_audio is None:
+            return True
+        if REGISTRY.get(normalized_audio, mark_accessed=False) is None:
             return f"Invalid audio id: {audio}"
         return True
 
@@ -580,14 +609,20 @@ class VLOMemoryLoadVideo(io.ComfyNode):
 
     @classmethod
     def fingerprint_inputs(cls, file):
-        item = REGISTRY.get(file, mark_accessed=False)
+        normalized_file = _normalize_media_id(file)
+        if normalized_file is None:
+            return "__unset__"
+        item = REGISTRY.get(normalized_file, mark_accessed=False)
         if item is None:
-            return file
+            return normalized_file
         return hashlib.sha256(item.data).hexdigest()
 
     @classmethod
     def validate_inputs(cls, file):
-        if REGISTRY.get(file, mark_accessed=False) is None:
+        normalized_file = _normalize_media_id(file)
+        if normalized_file is None:
+            return True
+        if REGISTRY.get(normalized_file, mark_accessed=False) is None:
             return f"Invalid video id: {file}"
         return True
 
