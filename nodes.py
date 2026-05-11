@@ -679,10 +679,13 @@ class VLOMemoryLoadAudio(io.ComfyNode):
             display_name="VLO Memory Load Audio",
             category="audio",
             inputs=[
+                # ComfyUI's native audio upload widget assumes an `audioUI` preview
+                # widget that is only auto-injected for built-in audio node classes.
+                # Keep this as a remote-backed combo so custom nodes do not crash the
+                # frontend during widget initialization.
                 io.Combo.Input(
                     "audio",
                     options=_list_input_files(["audio", "video"]),
-                    upload=io.UploadType.audio,
                     remote=io.RemoteOptions(
                         route="/api/vlo-memory/options?kind=audio",
                         refresh_button=True,
