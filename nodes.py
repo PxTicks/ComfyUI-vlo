@@ -5,6 +5,7 @@ import io as stdlib_io
 import json
 import logging
 import math
+import os
 import struct
 from fractions import Fraction
 from typing import Any
@@ -188,6 +189,113 @@ def _build_memory_output_item(
     }
 
 
+def _list_input_files(content_types: list[str]) -> list[str]:
+    input_dir = folder_paths.get_input_directory()
+    files = [
+        filename
+        for filename in os.listdir(input_dir)
+        if os.path.isfile(os.path.join(input_dir, filename))
+    ]
+    return sorted(folder_paths.filter_files_content_types(files, content_types))
+
+
+def _annotated_filepath_exists(raw_value: Any) -> bool:
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        return False
+    try:
+        return folder_paths.exists_annotated_filepath(raw_value)
+    except Exception:
+        return False
+
+
+def _should_load_from_filepath(raw_value: Any, *, disable_in_memory: bool) -> bool:
+    if disable_in_memory:
+        return True
+
+    normalized_media_id = _normalize_media_id(raw_value)
+    if normalized_media_id is not None and REGISTRY.get(normalized_media_id, mark_accessed=False) is not None:
+        return False
+
+    return _annotated_filepath_exists(raw_value)
+
+
+def _fingerprint_annotated_filepath(raw_value: str, *, use_mtime: bool) -> str | float:
+    media_path = folder_paths.get_annotated_filepath(raw_value)
+    if use_mtime:
+        return os.path.getmtime(media_path)
+
+    digest = hashlib.sha256()
+    with open(media_path, "rb") as media_file:
+        digest.update(media_file.read())
+    return digest.hexdigest()
+
+
+def _load_image_from_filepath(image_path: str) -> tuple[torch.Tensor, torch.Tensor]:
+    dtype = comfy.model_management.intermediate_dtype()
+    device = comfy.model_management.intermediate_device()
+
+    components = InputImpl.VideoFromFile(image_path).get_components()
+    if components.images.shape[0] > 0:
+        alpha = components.alpha
+        mask = (
+            (1.0 - alpha[..., -1]).to(device=device, dtype=dtype)
+            if alpha is not None
+            else torch.zeros(
+                (components.images.shape[0], 64, 64),
+                dtype=dtype,
+                device=device,
+            )
+        )
+        return components.images.to(device=device, dtype=dtype), mask
+
+    # This fallback keeps animated WebP support for formats PyAV can't decode here.
+    img = node_helpers.pillow(Image.open, image_path)
+    output_images: list[torch.Tensor] = []
+    output_masks: list[torch.Tensor] = []
+    width: int | None = None
+    height: int | None = None
+
+    for frame in ImageSequence.Iterator(img):
+        frame = node_helpers.pillow(ImageOps.exif_transpose, frame)
+
+        if frame.mode == "I":
+            frame = frame.point(lambda value: value * (1 / 255))
+        rgb_frame = frame.convert("RGB")
+
+        if len(output_images) == 0:
+            width, height = rgb_frame.size
+
+        if rgb_frame.size[0] != width or rgb_frame.size[1] != height:
+            continue
+
+        image = np.array(rgb_frame).astype(np.float32) / 255.0
+        image_tensor = torch.from_numpy(image)[None,]
+
+        if "A" in frame.getbands():
+            mask = np.array(frame.getchannel("A")).astype(np.float32) / 255.0
+            mask_tensor = 1.0 - torch.from_numpy(mask)
+        elif frame.mode == "P" and "transparency" in frame.info:
+            mask = np.array(frame.convert("RGBA").getchannel("A")).astype(np.float32) / 255.0
+            mask_tensor = 1.0 - torch.from_numpy(mask)
+        else:
+            mask_tensor = torch.zeros((64, 64), dtype=torch.float32, device="cpu")
+
+        output_images.append(image_tensor.to(dtype=dtype))
+        output_masks.append(mask_tensor.unsqueeze(0).to(dtype=dtype))
+
+        if img.format == "MPO":
+            break
+
+    if len(output_images) > 1:
+        output_image = torch.cat(output_images, dim=0)
+        output_mask = torch.cat(output_masks, dim=0)
+    else:
+        output_image = output_images[0]
+        output_mask = output_masks[0]
+
+    return output_image.to(device=device, dtype=dtype), output_mask.to(device=device, dtype=dtype)
+
+
 def _load_image_from_bytes(data: bytes) -> tuple[torch.Tensor, torch.Tensor]:
     img = node_helpers.pillow(Image.open, stdlib_io.BytesIO(data))
     output_images: list[torch.Tensor] = []
@@ -242,8 +350,8 @@ def _f32_pcm(wav: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Unsupported wav dtype: {wav.dtype}")
 
 
-def _load_audio_from_bytes(data: bytes) -> tuple[torch.Tensor, int]:
-    with av.open(stdlib_io.BytesIO(data)) as audio_file:
+def _load_audio_from_source(source: str | stdlib_io.BytesIO) -> tuple[torch.Tensor, int]:
+    with av.open(source) as audio_file:
         if not audio_file.streams.audio:
             raise ValueError("No audio stream found in the file.")
 
@@ -264,6 +372,14 @@ def _load_audio_from_bytes(data: bytes) -> tuple[torch.Tensor, int]:
         waveform = torch.cat(frames, dim=1)
         waveform = _f32_pcm(waveform)
         return waveform, sample_rate
+
+
+def _load_audio_from_bytes(data: bytes) -> tuple[torch.Tensor, int]:
+    return _load_audio_from_source(stdlib_io.BytesIO(data))
+
+
+def _load_audio_from_filepath(audio_path: str) -> tuple[torch.Tensor, int]:
+    return _load_audio_from_source(audio_path)
 
 
 def _normalize_mask_frames(masks: torch.Tensor) -> torch.Tensor:
@@ -497,25 +613,41 @@ class VLOMemoryLoadImage(io.ComfyNode):
             inputs=[
                 io.Combo.Input(
                     "image",
-                    options=[],
+                    options=_list_input_files(["image"]),
                     upload=io.UploadType.image,
                     remote=io.RemoteOptions(
                         route="/api/vlo-memory/options?kind=image",
                         refresh_button=True,
                     ),
-                )
+                ),
+                io.Boolean.Input(
+                    "disable_in_memory",
+                    default=False,
+                    tooltip=(
+                        "When true, load the selected image from ComfyUI's normal input "
+                        "directory instead of the VLO in-memory registry."
+                    ),
+                ),
             ],
             outputs=[io.Image.Output(), io.Mask.Output()],
         )
 
     @classmethod
-    def execute(cls, image) -> io.NodeOutput:
+    def execute(cls, image, disable_in_memory=False) -> io.NodeOutput:
+        if _should_load_from_filepath(image, disable_in_memory=disable_in_memory):
+            image_path = folder_paths.get_annotated_filepath(image)
+            output_image, output_mask = _load_image_from_filepath(image_path)
+            return io.NodeOutput(output_image, output_mask)
+
         item = _get_media_item(image, expected_kind="image")
         output_image, output_mask = _load_image_from_bytes(item.data)
         return io.NodeOutput(output_image, output_mask)
 
     @classmethod
-    def fingerprint_inputs(cls, image):
+    def fingerprint_inputs(cls, image, disable_in_memory=False):
+        if _should_load_from_filepath(image, disable_in_memory=disable_in_memory):
+            return _fingerprint_annotated_filepath(image, use_mtime=False)
+
         normalized_image = _normalize_media_id(image)
         if normalized_image is None:
             return "__unset__"
@@ -525,7 +657,12 @@ class VLOMemoryLoadImage(io.ComfyNode):
         return hashlib.sha256(item.data).hexdigest()
 
     @classmethod
-    def validate_inputs(cls, image):
+    def validate_inputs(cls, image, disable_in_memory=False):
+        if _should_load_from_filepath(image, disable_in_memory=disable_in_memory):
+            if not folder_paths.exists_annotated_filepath(image):
+                return f"Invalid image file: {image}"
+            return True
+
         normalized_image = _normalize_media_id(image)
         if normalized_image is None:
             return True
@@ -544,25 +681,41 @@ class VLOMemoryLoadAudio(io.ComfyNode):
             inputs=[
                 io.Combo.Input(
                     "audio",
-                    options=[],
+                    options=_list_input_files(["audio", "video"]),
                     upload=io.UploadType.audio,
                     remote=io.RemoteOptions(
                         route="/api/vlo-memory/options?kind=audio",
                         refresh_button=True,
                     ),
-                )
+                ),
+                io.Boolean.Input(
+                    "disable_in_memory",
+                    default=False,
+                    tooltip=(
+                        "When true, load the selected audio from ComfyUI's normal input "
+                        "directory instead of the VLO in-memory registry."
+                    ),
+                ),
             ],
             outputs=[io.Audio.Output()],
         )
 
     @classmethod
-    def execute(cls, audio) -> io.NodeOutput:
+    def execute(cls, audio, disable_in_memory=False) -> io.NodeOutput:
+        if _should_load_from_filepath(audio, disable_in_memory=disable_in_memory):
+            audio_path = folder_paths.get_annotated_filepath(audio)
+            waveform, sample_rate = _load_audio_from_filepath(audio_path)
+            return io.NodeOutput({"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate})
+
         item = _get_media_item(audio, expected_kind="audio")
         waveform, sample_rate = _load_audio_from_bytes(item.data)
         return io.NodeOutput({"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate})
 
     @classmethod
-    def fingerprint_inputs(cls, audio):
+    def fingerprint_inputs(cls, audio, disable_in_memory=False):
+        if _should_load_from_filepath(audio, disable_in_memory=disable_in_memory):
+            return _fingerprint_annotated_filepath(audio, use_mtime=False)
+
         normalized_audio = _normalize_media_id(audio)
         if normalized_audio is None:
             return "__unset__"
@@ -572,7 +725,12 @@ class VLOMemoryLoadAudio(io.ComfyNode):
         return hashlib.sha256(item.data).hexdigest()
 
     @classmethod
-    def validate_inputs(cls, audio):
+    def validate_inputs(cls, audio, disable_in_memory=False):
+        if _should_load_from_filepath(audio, disable_in_memory=disable_in_memory):
+            if not folder_paths.exists_annotated_filepath(audio):
+                return f"Invalid audio file: {audio}"
+            return True
+
         normalized_audio = _normalize_media_id(audio)
         if normalized_audio is None:
             return True
@@ -591,24 +749,39 @@ class VLOMemoryLoadVideo(io.ComfyNode):
             inputs=[
                 io.Combo.Input(
                     "file",
-                    options=[],
+                    options=_list_input_files(["video"]),
                     upload=io.UploadType.video,
                     remote=io.RemoteOptions(
                         route="/api/vlo-memory/options?kind=video",
                         refresh_button=True,
                     ),
-                )
+                ),
+                io.Boolean.Input(
+                    "disable_in_memory",
+                    default=False,
+                    tooltip=(
+                        "When true, load the selected video from ComfyUI's normal input "
+                        "directory instead of the VLO in-memory registry."
+                    ),
+                ),
             ],
             outputs=[io.Video.Output()],
         )
 
     @classmethod
-    def execute(cls, file) -> io.NodeOutput:
+    def execute(cls, file, disable_in_memory=False) -> io.NodeOutput:
+        if _should_load_from_filepath(file, disable_in_memory=disable_in_memory):
+            video_path = folder_paths.get_annotated_filepath(file)
+            return io.NodeOutput(InputImpl.VideoFromFile(video_path))
+
         item = _get_media_item(file, expected_kind="video")
         return io.NodeOutput(InputImpl.VideoFromFile(stdlib_io.BytesIO(item.data)))
 
     @classmethod
-    def fingerprint_inputs(cls, file):
+    def fingerprint_inputs(cls, file, disable_in_memory=False):
+        if _should_load_from_filepath(file, disable_in_memory=disable_in_memory):
+            return _fingerprint_annotated_filepath(file, use_mtime=True)
+
         normalized_file = _normalize_media_id(file)
         if normalized_file is None:
             return "__unset__"
@@ -618,7 +791,12 @@ class VLOMemoryLoadVideo(io.ComfyNode):
         return hashlib.sha256(item.data).hexdigest()
 
     @classmethod
-    def validate_inputs(cls, file):
+    def validate_inputs(cls, file, disable_in_memory=False):
+        if _should_load_from_filepath(file, disable_in_memory=disable_in_memory):
+            if not folder_paths.exists_annotated_filepath(file):
+                return f"Invalid video file: {file}"
+            return True
+
         normalized_file = _normalize_media_id(file)
         if normalized_file is None:
             return True
