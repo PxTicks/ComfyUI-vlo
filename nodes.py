@@ -42,6 +42,11 @@ _DEFAULT_CONTENT_TYPES = {
     "audio": "audio/wav",
 }
 _UI_PLACEHOLDER_MEDIA_IDS = frozenset({"loading..."})
+_INPUT_KIND_CONTENT_TYPES: dict[str, list[str]] = {
+    "image": ["image"],
+    "audio": ["audio", "video"],
+    "video": ["video"],
+}
 
 
 def _json_error(status: int, message: str) -> web.Response:
@@ -571,6 +576,19 @@ async def list_memory_media_options(request: web.Request) -> web.Response:
 
     options = [item.media_id for item in REGISTRY.list_media(kind=kind)]
     return web.json_response(options)
+
+
+@PromptServer.instance.routes.get("/api/vlo-memory/input-files")
+async def list_memory_input_files(request: web.Request) -> web.Response:
+    kind = _normalize_kind(request.query.get("kind"))
+    if kind is None:
+        return _json_error(400, "Invalid or missing media kind")
+
+    content_types = _INPUT_KIND_CONTENT_TYPES.get(kind)
+    if content_types is None:
+        return _json_error(400, "Unsupported media kind for input folder listing")
+
+    return web.json_response(_list_input_files(content_types))
 
 
 @PromptServer.instance.routes.get("/api/vlo-memory/view/{media_id}")
