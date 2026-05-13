@@ -596,10 +596,10 @@ async def view_memory_media(request: web.Request) -> web.Response:
     media_id = request.match_info.get("media_id", "")
     item = REGISTRY.get(media_id)
     if item is None:
-        logger.warning("VLO memory media not found: media_id=%s", media_id)
+        logger.warning("vlo memory media not found: media_id=%s", media_id)
         return _json_error(404, "Unknown media id")
     logger.debug(
-        "VLO memory media served: media_id=%s filename=%s content_type=%s size_bytes=%s",
+        "vlo memory media served: media_id=%s filename=%s content_type=%s size_bytes=%s",
         media_id,
         item.filename,
         item.content_type,
@@ -621,12 +621,12 @@ async def delete_memory_media(request: web.Request) -> web.Response:
     return web.json_response(_media_summary(item))
 
 
-class VLOMemoryLoadImage(io.ComfyNode):
+class vloMemoryLoadImage(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="VLOMemoryLoadImage",
-            display_name="VLO Memory Load Image",
+            node_id="vloMemoryLoadImage",
+            display_name="vlo Memory Load Image",
             category="image",
             inputs=[
                 io.Combo.Input(
@@ -643,7 +643,7 @@ class VLOMemoryLoadImage(io.ComfyNode):
                     default=False,
                     tooltip=(
                         "When true, load the selected image from ComfyUI's normal input "
-                        "directory instead of the VLO in-memory registry."
+                        "directory instead of the vlo in-memory registry."
                     ),
                 ),
             ],
@@ -689,12 +689,12 @@ class VLOMemoryLoadImage(io.ComfyNode):
         return True
 
 
-class VLOMemoryLoadAudio(io.ComfyNode):
+class vloMemoryLoadAudio(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="VLOMemoryLoadAudio",
-            display_name="VLO Memory Load Audio",
+            node_id="vloMemoryLoadAudio",
+            display_name="vlo Memory Load Audio",
             category="audio",
             inputs=[
                 # ComfyUI's native audio upload widget assumes an `audioUI` preview
@@ -714,7 +714,7 @@ class VLOMemoryLoadAudio(io.ComfyNode):
                     default=False,
                     tooltip=(
                         "When true, load the selected audio from ComfyUI's normal input "
-                        "directory instead of the VLO in-memory registry."
+                        "directory instead of the vlo in-memory registry."
                     ),
                 ),
             ],
@@ -760,12 +760,12 @@ class VLOMemoryLoadAudio(io.ComfyNode):
         return True
 
 
-class VLOMemoryLoadVideo(io.ComfyNode):
+class vloMemoryLoadVideo(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="VLOMemoryLoadVideo",
-            display_name="VLO Memory Load Video",
+            node_id="vloMemoryLoadVideo",
+            display_name="vlo Memory Load Video",
             category="image/video",
             inputs=[
                 io.Combo.Input(
@@ -782,7 +782,7 @@ class VLOMemoryLoadVideo(io.ComfyNode):
                     default=False,
                     tooltip=(
                         "When true, load the selected video from ComfyUI's normal input "
-                        "directory instead of the VLO in-memory registry."
+                        "directory instead of the vlo in-memory registry."
                     ),
                 ),
             ],
@@ -826,18 +826,18 @@ class VLOMemoryLoadVideo(io.ComfyNode):
         return True
 
 
-class VLOVideoConvertFps(io.ComfyNode):
+class vloVideoConvertFps(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="VLOVideoConvertFps",
+            node_id="vloVideoConvertFps",
             search_aliases=[
                 "convert video fps",
                 "resample video fps",
                 "retime video fps",
                 "change video fps",
             ],
-            display_name="VLO Video Convert FPS",
+            display_name="vlo Video Convert FPS",
             category="image/video",
             description=(
                 "Resamples a video to a target FPS while preserving audio and overall clip "
@@ -869,13 +869,13 @@ class VLOVideoConvertFps(io.ComfyNode):
         return io.NodeOutput(_resample_video_frames_to_fps(video, target_fps=fps))
 
 
-class VLOSaveImageWebsocketBMP(io.ComfyNode):
+class vloSaveImageWebsocketBMP(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="VLOSaveImageWebsocketBMP",
+            node_id="vloSaveImageWebsocketBMP",
             search_aliases=["bmp websocket", "save image websocket bmp"],
-            display_name="VLO Save Image Websocket (BMP)",
+            display_name="vlo Save Image Websocket (BMP)",
             category="api/image",
             description=(
                 "Streams full-size images to the websocket as BMP payloads. "
@@ -925,16 +925,16 @@ class VLOSaveImageWebsocketBMP(io.ComfyNode):
         return io.NodeOutput()
 
 
-class VLOSaveVideoWebsocket(io.ComfyNode):
+class vloSaveVideoWebsocket(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="VLOSaveVideoWebsocket",
+            node_id="vloSaveVideoWebsocket",
             search_aliases=["export video websocket", "save video websocket"],
-            display_name="VLO Save Video Websocket",
+            display_name="vlo Save Video Websocket",
             category="api/video",
             description=(
-                "Stores the input video in VLO memory and emits a websocket result "
+                "Stores the input video in vlo memory and emits a websocket result "
                 "entry so the frontend can fetch it immediately without saving to disk."
             ),
             inputs=[
@@ -1004,7 +1004,7 @@ class VLOSaveVideoWebsocket(io.ComfyNode):
         )
         node_id, prompt_id = _get_execution_ids()
         logger.info(
-            "Registered VLO websocket video output: media_id=%s filename=%s subfolder=%s content_type=%s size_bytes=%s client_id=%s node_id=%s prompt_id=%s",
+            "Registered vlo websocket video output: media_id=%s filename=%s subfolder=%s content_type=%s size_bytes=%s client_id=%s node_id=%s prompt_id=%s",
             item.media_id,
             item.filename,
             subfolder,
@@ -1128,13 +1128,13 @@ class LTXSetAudioLatentBinaryMasks(io.ComfyNode):
         return io.NodeOutput(output)
 
 
-class VLOLatentCompositeMasked(io.ComfyNode):
+class vloLatentCompositeMasked(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="VLOLatentCompositeMasked",
+            node_id="vloLatentCompositeMasked",
             search_aliases=["vlo composite latent", "vlo inpaint latent"],
-            display_name="VLO Latent Composite Masked",
+            display_name="vlo Latent Composite Masked",
             category="latent/composite",
             description=(
                 "Composites a source latent into a destination latent using "
@@ -1196,14 +1196,14 @@ class VLOLatentCompositeMasked(io.ComfyNode):
         return io.NodeOutput(output)
 
 
-class VLOGateNone(io.ComfyNode):
+class vloGateNone(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         template = io.MatchType.Template("value")
         return io.Schema(
-            node_id="VLOGateNone",
+            node_id="vloGateNone",
             search_aliases=["gate", "null gate", "disable pass-through", "none gate"],
-            display_name="VLO Gate None",
+            display_name="vlo Gate None",
             category="utils/logic",
             description=(
                 "Passes any connected value through unchanged unless disabled is true, "
@@ -1234,13 +1234,13 @@ class VLOGateNone(io.ComfyNode):
         return io.NodeOutput(None if disabled else value)
 
 
-class VLOLogicNot(io.ComfyNode):
+class vloLogicNot(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="VLOLogicNot",
+            node_id="vloLogicNot",
             search_aliases=["not", "invert boolean", "logic not", "boolean not"],
-            display_name="VLO Logic Not",
+            display_name="vlo Logic Not",
             category="utils/logic",
             description="Inverts an incoming boolean value.",
             inputs=[
@@ -1260,22 +1260,22 @@ class VLOLogicNot(io.ComfyNode):
         return io.NodeOutput(not value)
 
 
-class VLOExtension(ComfyExtension):
+class vloExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
         return [
-            VLOMemoryLoadImage,
-            VLOMemoryLoadAudio,
-            VLOMemoryLoadVideo,
-            VLOVideoConvertFps,
-            VLOSaveImageWebsocketBMP,
-            VLOSaveVideoWebsocket,
+            vloMemoryLoadImage,
+            vloMemoryLoadAudio,
+            vloMemoryLoadVideo,
+            vloVideoConvertFps,
+            vloSaveImageWebsocketBMP,
+            vloSaveVideoWebsocket,
             LTXSetAudioLatentBinaryMasks,
-            VLOLatentCompositeMasked,
-            VLOGateNone,
-            VLOLogicNot,
+            vloLatentCompositeMasked,
+            vloGateNone,
+            vloLogicNot,
         ]
 
 
-async def comfy_entrypoint() -> VLOExtension:
-    return VLOExtension()
+async def comfy_entrypoint() -> vloExtension:
+    return vloExtension()

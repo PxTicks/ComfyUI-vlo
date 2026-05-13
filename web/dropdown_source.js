@@ -2,9 +2,9 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
 const NODE_CONFIGS = {
-    VLOMemoryLoadImage: { kind: "image", fileWidget: "image" },
-    VLOMemoryLoadAudio: { kind: "audio", fileWidget: "audio" },
-    VLOMemoryLoadVideo: { kind: "video", fileWidget: "file" },
+    vloMemoryLoadImage: { kind: "image", fileWidget: "image" },
+    vloMemoryLoadAudio: { kind: "audio", fileWidget: "audio" },
+    vloMemoryLoadVideo: { kind: "video", fileWidget: "file" },
 };
 
 function findWidget(node, name) {
@@ -12,7 +12,7 @@ function findWidget(node, name) {
 }
 
 app.registerExtension({
-    name: "VLO.MemoryLoader.InputFolderDropdown",
+    name: "vlo.MemoryLoader.InputFolderDropdown",
     async nodeCreated(node) {
         const config = NODE_CONFIGS[node.comfyClass];
         if (!config) return;
@@ -33,7 +33,7 @@ app.registerExtension({
                     );
                     if (!resp.ok) {
                         console.error(
-                            `VLO: input-files request failed (${resp.status})`
+                            `vlo: input-files request failed (${resp.status})`
                         );
                         return;
                     }
@@ -41,7 +41,7 @@ app.registerExtension({
                     inputFiles = Array.isArray(data) ? data : [];
                     node.setDirtyCanvas?.(true, false);
                 } catch (err) {
-                    console.error("VLO: failed to fetch input folder files", err);
+                    console.error("vlo: failed to fetch input folder files", err);
                 } finally {
                     inputFetchPromise = null;
                 }
