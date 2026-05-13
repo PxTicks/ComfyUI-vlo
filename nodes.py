@@ -1246,7 +1246,6 @@ class vloLogicNot(io.ComfyNode):
             inputs=[
                 io.Boolean.Input(
                     "value",
-                    default=False,
                     tooltip="The boolean value to invert.",
                 ),
             ],
@@ -1256,7 +1255,7 @@ class vloLogicNot(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, value=False) -> io.NodeOutput:
+    def execute(cls, value) -> io.NodeOutput:
         return io.NodeOutput(not value)
 
 
