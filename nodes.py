@@ -1234,6 +1234,32 @@ class VLOGateNone(io.ComfyNode):
         return io.NodeOutput(None if disabled else value)
 
 
+class VLOLogicNot(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="VLOLogicNot",
+            search_aliases=["not", "invert boolean", "logic not", "boolean not"],
+            display_name="VLO Logic Not",
+            category="utils/logic",
+            description="Inverts an incoming boolean value.",
+            inputs=[
+                io.Boolean.Input(
+                    "value",
+                    default=False,
+                    tooltip="The boolean value to invert.",
+                ),
+            ],
+            outputs=[
+                io.Boolean.Output(display_name="value")
+            ],
+        )
+
+    @classmethod
+    def execute(cls, value=False) -> io.NodeOutput:
+        return io.NodeOutput(not value)
+
+
 class VLOExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
@@ -1247,6 +1273,7 @@ class VLOExtension(ComfyExtension):
             LTXSetAudioLatentBinaryMasks,
             VLOLatentCompositeMasked,
             VLOGateNone,
+            VLOLogicNot,
         ]
 
 
