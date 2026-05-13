@@ -241,7 +241,7 @@ def _load_image_from_filepath(image_path: str) -> tuple[torch.Tensor, torch.Tens
 
     components = InputImpl.VideoFromFile(image_path).get_components()
     if components.images.shape[0] > 0:
-        alpha = components.alpha
+        alpha = getattr(components, "alpha", None)
         mask = (
             (1.0 - alpha[..., -1]).to(device=device, dtype=dtype)
             if alpha is not None
