@@ -1246,6 +1246,7 @@ class vloLogicNot(io.ComfyNode):
             inputs=[
                 io.Boolean.Input(
                     "value",
+                    force_input=True,
                     tooltip="The boolean value to invert.",
                 ),
             ],
