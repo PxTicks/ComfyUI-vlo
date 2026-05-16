@@ -612,6 +612,15 @@ async def view_memory_media(request: web.Request) -> web.Response:
     )
 
 
+@PromptServer.instance.routes.get("/api/vlo-memory/item/{media_id}")
+async def get_memory_media_item(request: web.Request) -> web.Response:
+    media_id = request.match_info.get("media_id", "")
+    item = REGISTRY.get(media_id)
+    if item is None:
+        return _json_error(404, "Unknown media id")
+    return web.json_response(_media_summary(item))
+
+
 @PromptServer.instance.routes.delete("/api/vlo-memory/item/{media_id}")
 async def delete_memory_media(request: web.Request) -> web.Response:
     media_id = request.match_info.get("media_id", "")
