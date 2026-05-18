@@ -39,6 +39,7 @@ app.registerExtension({
                     }
                     const data = await resp.json();
                     inputFiles = Array.isArray(data) ? data : [];
+                    reconcileFileWidgetValue();
                     node.setDirtyCanvas?.(true, false);
                 } catch (err) {
                     console.error("vlo: failed to fetch input folder files", err);
@@ -51,14 +52,21 @@ app.registerExtension({
 
         // Wrap the existing `values` descriptor (installed by the remote-widget
         // setup for the memory source) so we can swap sources based on the toggle.
+        // If the original descriptor has no setter, fall back to a local cache so
+        // writes from ComfyUI's remote refresh aren't silently dropped.
         const options = fileWidget.options;
         const descriptor = Object.getOwnPropertyDescriptor(options, "values");
+        let localMemoryValues = Array.isArray(descriptor?.value)
+            ? descriptor.value.slice()
+            : null;
         const readMemoryValues = descriptor?.get
             ? () => descriptor.get.call(options)
-            : () => (Array.isArray(descriptor?.value) ? descriptor.value : []);
+            : () => (localMemoryValues !== null ? localMemoryValues : []);
         const writeMemoryValues = descriptor?.set
             ? (value) => descriptor.set.call(options, value)
-            : null;
+            : (value) => {
+                  localMemoryValues = Array.isArray(value) ? value.slice() : null;
+              };
 
         Object.defineProperty(options, "values", {
             configurable: true,
@@ -74,9 +82,33 @@ app.registerExtension({
                 return readMemoryValues();
             },
             set(value) {
-                writeMemoryValues?.(value);
+                writeMemoryValues(value);
             },
         });
+
+        // When input-folder mode is active, ensure the file widget's `value`
+        // stays a string from the folder-backed options list. Without this, the
+        // serialized widget value can drift into non-string territory and
+        // ComfyUI can embed broken workflow metadata for these nodes.
+        const reconcileFileWidgetValue = () => {
+            // Skip while the input-folder list is still loading; the post-fetch
+            // path will call us again with real options.
+            if (toggleWidget.value && inputFiles === null) return;
+
+            const validOptions = options.values;
+            if (!Array.isArray(validOptions)) return;
+
+            const currentValue = fileWidget.value;
+            const isStringValue =
+                typeof currentValue === "string" && currentValue.length > 0;
+            if (isStringValue && validOptions.includes(currentValue)) return;
+
+            const replacement =
+                validOptions.length > 0 ? validOptions[0] : "";
+            if (fileWidget.value === replacement) return;
+            fileWidget.value = replacement;
+            node.setDirtyCanvas?.(true, true);
+        };
 
         const originalToggleCallback = toggleWidget.callback;
         toggleWidget.callback = function (value) {
