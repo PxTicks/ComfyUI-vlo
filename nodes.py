@@ -1270,7 +1270,6 @@ class vloLogicNot(io.ComfyNode):
         return io.NodeOutput(not value)
 
 
-_TTM_APPLY_MODEL_KEY = "vloTTM_ApplyModel"
 _TTM_OUTER_SAMPLE_KEY = "vloTTM_OuterSample"
 
 
@@ -1327,35 +1326,20 @@ def _ttm_align_mask(
     return mask.squeeze(1).view(1, 1, latent_frames, latent_height, latent_width)
 
 
-class _TTMApplyModel:
-    def __init__(self, reference, noise, mask, model_sampling, sigma_start, sigma_end):
-        self.reference = reference
-        self.noise = noise
-        self.mask = mask
-        self.model_sampling = model_sampling
-        self.sigma_start = sigma_start
+class _TTMDenoiseMaskSchedule:
+    """Closes the TTM window once the schedule drops past sigma_end.
+
+    KSamplerX0Inpaint holds the masked region for the whole run; TTM only wants it held
+    for the opening steps, and this is the hook Comfy provides for varying that per sigma.
+    """
+
+    def __init__(self, sigma_end):
         self.sigma_end = sigma_end
 
-    def __call__(self, executor, x, t, c_concat, c_crossattn, control, transformer_options, **kwargs):
-        sigma = t.flatten()[0]
-
-        # Gate on the noise level, never on a step index. Multi-evaluation solvers call the
-        # model at intermediate sigmas that are not on the schedule at all (dpmpp_sde's
-        # denoised_2 runs at sigma_s_1), so any step index we matched them to would be a
-        # fiction, and the reference would be noised to a level x is not at.
-        # sigma_start itself is excluded: that call's x is the init, already the reference.
-        if not (self.sigma_end <= float(sigma) < self.sigma_start):
-            return executor(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
-
-        # Noised to this evaluation's own sigma, whatever it is, so the masked region never
-        # contradicts the noise level the model was told to denoise.
-        reference = self.model_sampling.noise_scaling(
-            sigma, self.noise.to(x), self.reference.to(x)
-        )
-        mask = self.mask.to(x)
-        x = x * (1.0 - mask) + reference * mask
-
-        return executor(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
+    def __call__(self, sigma, denoise_mask, extra_options=None):
+        if float(sigma.flatten()[0]) < self.sigma_end:
+            return torch.ones_like(denoise_mask)
+        return denoise_mask
 
 
 class _TTMOuterSample:
@@ -1365,17 +1349,17 @@ class _TTMOuterSample:
         self.start_step = start_step
         self.end_step = end_step
 
-    def __call__(self, executor, noise, latent_image, sampler, sigmas, *args, **kwargs):
+    def __call__(self, executor, noise, latent_image, sampler, sigmas, denoise_mask=None, *args, **kwargs):
         guider = executor.class_obj
         model = guider.model_patcher.model
 
         if torch.count_nonzero(noise) == 0:
             logger.warning(
                 "vloTimeToMove: this sampler adds no noise, so there is nothing to seed the "
-                "reference into and no noise to re-inject it with; skipping TTM here. Patch "
-                "only the model of the sampler that starts the schedule."
+                "reference into and no noise to hold it with; skipping TTM here. Patch only "
+                "the model of the sampler that starts the schedule."
             )
-            return executor(noise, latent_image, sampler, sigmas, *args, **kwargs)
+            return executor(noise, latent_image, sampler, sigmas, denoise_mask, *args, **kwargs)
 
         latent_shapes = kwargs.get("latent_shapes") or [noise.shape]
         latent_shape = latent_shapes[0]
@@ -1400,12 +1384,16 @@ class _TTMOuterSample:
                 "pure noise with no trace of the reference. The motion cue TTM relies on comes "
                 "from that init; use 1 or more."
             )
+        if denoise_mask is not None:
+            logger.warning(
+                "vloTimeToMove: replacing the noise_mask already on the sampled latent; TTM "
+                "drives the denoise mask itself."
+            )
 
-        reference = reference.to(noise.device)
-
-        # The sampler noises latent_image into x0 (CFGGuider.inner_sample -> KSAMPLER.sample),
-        # so the reference has to *be* that latent for the init to carry the reference motion.
-        # Handed over raw: inner_sample applies process_latent_in to it below us.
+        # Handed over raw. inner_sample runs process_latent_in on it, and KSAMPLER.sample then
+        # keeps that normalised tensor as KSamplerX0Inpaint's reference -- so both the init and
+        # the per-step hold read the reference in model space, from one source.
+        # outer_sample moves it onto the load device below us, along with noise and sigmas.
         latent_image = reference
 
         # Dropping the leading sigmas is what makes x0 a partially-noised reference rather than
@@ -1413,40 +1401,35 @@ class _TTMOuterSample:
         # start_at_step, but kept here so the two can't fall out of step.
         sigmas = sigmas[self.start_step:]
 
-        # process_latent_in runs in inner_sample, one level below this wrapper. The per-step
-        # hook injects straight into x, so its copy of the reference must be normalised here or
-        # it lands in VAE space -- channel means to +/-1.55 and stds to 3.27 against a latent
-        # that is meant to be unit-normal, which burns out the masked region.
-        reference_model_space = model.process_latent_in(reference)
+        # -1 because holding the region *during* the step at sigmas[k] leaves it held at
+        # sigmas[k+1]. So to stop holding at end_step, the last pinned call is end_step - 1.
+        # This is what makes end_step mean the same thing it means in the TTM reference
+        # implementation, where the hold runs while step < end_step.
+        last_index = self.end_step - self.start_step - 1
+        if last_index < 0:
+            # Window closed: seed the init from the reference and let the region run free.
+            return executor(noise, latent_image, sampler, sigmas, None, *args, **kwargs)
 
-        mask = _ttm_align_mask(
+        # The load device, not noise.device: noise is still on the CPU here, and unlike noise,
+        # latent_image and sigmas, outer_sample never moves denoise_mask -- Comfy normally
+        # places it in CFGGuider.sample via prepare_mask, which has already run by now.
+        ttm_mask = _ttm_align_mask(
             self.mask,
             latent_shape,
             getattr(model.latent_format, "temporal_downscale_ratio", 4),
-        ).to(noise.device)
+        ).to(device=guider.model_patcher.load_device, dtype=torch.float32)
 
-        # Translate the step window into a sigma window once, here, where the schedule is
-        # known. The per-call hook then needs no step arithmetic and stays correct for
-        # solvers that evaluate the model off-schedule.
-        last_index = min(self.end_step - self.start_step, sigmas.shape[-1] - 1)
-        sigma_start = float(sigmas[0])
-        sigma_end = float(sigmas[last_index]) if last_index >= 1 else float("inf")
+        # Comfy's denoise_mask marks where to *denoise*; ours marks where to hold the
+        # reference, so it goes in inverted. KSamplerX0Inpaint (samplers.py:633) then noises
+        # the reference to each evaluation's own sigma on the way in and pins the x0
+        # prediction to it on the way out -- which is what actually holds the region, and
+        # holds it for any solver, including ones that evaluate off-schedule.
+        denoise_mask = 1.0 - ttm_mask
 
-        transformer_options = guider.model_options.setdefault("transformer_options", {})
-        wrappers = transformer_options.setdefault("wrappers", {})
-        apply_model_wrappers = wrappers.setdefault(WrappersMP.APPLY_MODEL, {})
-        apply_model_wrappers[_TTM_APPLY_MODEL_KEY] = [
-            _TTMApplyModel(
-                reference_model_space,
-                noise,
-                mask,
-                model.model_sampling,
-                sigma_start,
-                sigma_end,
-            )
-        ]
+        sigma_end = float(sigmas[min(last_index, sigmas.shape[-1] - 1)])
+        guider.model_options["denoise_mask_function"] = _TTMDenoiseMaskSchedule(sigma_end)
 
-        return executor(noise, latent_image, sampler, sigmas, *args, **kwargs)
+        return executor(noise, latent_image, sampler, sigmas, denoise_mask, *args, **kwargs)
 
 
 class vloTimeToMove(io.ComfyNode):
@@ -1461,9 +1444,11 @@ class vloTimeToMove(io.ComfyNode):
                 "Patches a video model to follow the motion in a reference clip, as in "
                 "Time-to-Move (https://github.com/time-to-move/TTM). The reference latents "
                 "seed the sampler's starting latent, which is what carries the intended "
-                "motion, and are then blended back into the masked region for the first few "
-                "steps to hold it to the reference. Patch only the model of the sampler that "
-                "starts the schedule, and leave that sampler's start_at_step at 0."
+                "motion, and the masked region is then held to the reference for the opening "
+                "steps via Comfy's own inpaint path, so it works with any sampler. Patch only "
+                "the model of the sampler that starts the schedule, and leave that sampler's "
+                "start_at_step at 0. Drives the denoise mask, so any noise_mask already on "
+                "the sampled latent is replaced."
             ),
             inputs=[
                 io.Model.Input("model"),
@@ -1503,9 +1488,10 @@ class vloTimeToMove(io.ComfyNode):
                     min=0,
                     max=1000,
                     tooltip=(
-                        "Last step whose input has the reference blended into the masked "
-                        "region. Set at or below start_step to seed the init only and let the "
-                        "masked region evolve freely afterwards."
+                        "The step at which the region stops being held to the reference and "
+                        "starts denoising freely. Exclusive, and counted the same way the TTM "
+                        "reference implementation counts it. Set at or below start_step to "
+                        "seed the init only and never hold the region at all."
                     ),
                 ),
             ],
