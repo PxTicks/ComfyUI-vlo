@@ -23,6 +23,7 @@ from typing_extensions import override
 
 import comfy.model_management
 from comfy.cli_args import args
+from comfy.patcher_extension import WrappersMP
 from comfy_api.latest import ComfyExtension, Input, InputImpl, Types, io
 from comfy_execution.utils import get_executing_context
 
@@ -1269,6 +1270,260 @@ class vloLogicNot(io.ComfyNode):
         return io.NodeOutput(not value)
 
 
+_TTM_APPLY_MODEL_KEY = "vloTTM_ApplyModel"
+_TTM_OUTER_SAMPLE_KEY = "vloTTM_OuterSample"
+
+
+def _ttm_align_mask(
+    mask: torch.Tensor,
+    latent_shape: torch.Size,
+    temporal_ratio: int,
+) -> torch.Tensor:
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+    if mask.ndim != 3:
+        raise ValueError(
+            f"mask must be [H, W] or [frames, H, W], got {tuple(mask.shape)}."
+        )
+
+    latent_frames, latent_height, latent_width = (
+        latent_shape[2],
+        latent_shape[-2],
+        latent_shape[-1],
+    )
+    mask = mask.to(torch.float32)
+    frames = mask.shape[0]
+
+    # The VAE encodes source frame 0 into latent frame 0, then frames
+    # (ratio*j - ratio + 1) .. (ratio*j) into latent frame j. Striding by the ratio
+    # therefore lands every sampled frame inside the group it masks. Interpolating
+    # along time instead would blend neighbouring frames and drift out of alignment,
+    # smearing the mask of anything that moves.
+    if frames == 1:
+        mask = mask.expand(latent_frames, -1, -1)
+    elif frames != latent_frames:
+        strided = mask[::temporal_ratio]
+        if strided.shape[0] == latent_frames:
+            mask = strided
+        else:
+            logger.warning(
+                "vloTimeToMove: %d mask frames do not stride onto %d latent frames at "
+                "ratio %d; falling back to nearest-frame resampling, which may misalign "
+                "the mask. Feed a mask whose frame count matches the reference video.",
+                frames,
+                latent_frames,
+                temporal_ratio,
+            )
+            index = torch.linspace(0, frames - 1, latent_frames).round().long()
+            mask = mask[index]
+
+    # Nearest keeps the mask hard-edged. A linear kernel would leave a ring of partial
+    # values around the subject, blending reference into generated content there.
+    mask = torch.nn.functional.interpolate(
+        mask.unsqueeze(1),
+        size=(latent_height, latent_width),
+        mode="nearest",
+    )
+    return mask.squeeze(1).view(1, 1, latent_frames, latent_height, latent_width)
+
+
+class _TTMApplyModel:
+    def __init__(self, reference, noise, mask, model_sampling, sigma_start, sigma_end):
+        self.reference = reference
+        self.noise = noise
+        self.mask = mask
+        self.model_sampling = model_sampling
+        self.sigma_start = sigma_start
+        self.sigma_end = sigma_end
+
+    def __call__(self, executor, x, t, c_concat, c_crossattn, control, transformer_options, **kwargs):
+        sigma = t.flatten()[0]
+
+        # Gate on the noise level, never on a step index. Multi-evaluation solvers call the
+        # model at intermediate sigmas that are not on the schedule at all (dpmpp_sde's
+        # denoised_2 runs at sigma_s_1), so any step index we matched them to would be a
+        # fiction, and the reference would be noised to a level x is not at.
+        # sigma_start itself is excluded: that call's x is the init, already the reference.
+        if not (self.sigma_end <= float(sigma) < self.sigma_start):
+            return executor(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
+
+        # Noised to this evaluation's own sigma, whatever it is, so the masked region never
+        # contradicts the noise level the model was told to denoise.
+        reference = self.model_sampling.noise_scaling(
+            sigma, self.noise.to(x), self.reference.to(x)
+        )
+        mask = self.mask.to(x)
+        x = x * (1.0 - mask) + reference * mask
+
+        return executor(x, t, c_concat, c_crossattn, control, transformer_options, **kwargs)
+
+
+class _TTMOuterSample:
+    def __init__(self, reference_latents, mask, start_step, end_step):
+        self.reference_latents = reference_latents
+        self.mask = mask
+        self.start_step = start_step
+        self.end_step = end_step
+
+    def __call__(self, executor, noise, latent_image, sampler, sigmas, *args, **kwargs):
+        guider = executor.class_obj
+        model = guider.model_patcher.model
+
+        if torch.count_nonzero(noise) == 0:
+            logger.warning(
+                "vloTimeToMove: this sampler adds no noise, so there is nothing to seed the "
+                "reference into and no noise to re-inject it with; skipping TTM here. Patch "
+                "only the model of the sampler that starts the schedule."
+            )
+            return executor(noise, latent_image, sampler, sigmas, *args, **kwargs)
+
+        latent_shapes = kwargs.get("latent_shapes") or [noise.shape]
+        latent_shape = latent_shapes[0]
+
+        reference = self.reference_latents["samples"]
+        if tuple(reference.shape) != tuple(latent_shape):
+            raise ValueError(
+                f"reference_latents {tuple(reference.shape)} must match the sampled latent "
+                f"{tuple(latent_shape)}. Encode the reference video at the same resolution "
+                f"and frame count the sampler is generating."
+            )
+
+        available_steps = sigmas.shape[-1] - 1
+        if self.start_step >= available_steps:
+            raise ValueError(
+                f"start_step ({self.start_step}) must be less than the {available_steps} "
+                f"steps this sampler runs."
+            )
+        if self.start_step == 0:
+            logger.warning(
+                "vloTimeToMove: start_step is 0, where sigma is 1.0 and the init is therefore "
+                "pure noise with no trace of the reference. The motion cue TTM relies on comes "
+                "from that init; use 1 or more."
+            )
+
+        reference = reference.to(noise.device)
+
+        # The sampler noises latent_image into x0 (CFGGuider.inner_sample -> KSAMPLER.sample),
+        # so the reference has to *be* that latent for the init to carry the reference motion.
+        # Handed over raw: inner_sample applies process_latent_in to it below us.
+        latent_image = reference
+
+        # Dropping the leading sigmas is what makes x0 a partially-noised reference rather than
+        # pure noise, and skips the steps we jumped over. Equivalent to raising the sampler's
+        # start_at_step, but kept here so the two can't fall out of step.
+        sigmas = sigmas[self.start_step:]
+
+        # process_latent_in runs in inner_sample, one level below this wrapper. The per-step
+        # hook injects straight into x, so its copy of the reference must be normalised here or
+        # it lands in VAE space -- channel means to +/-1.55 and stds to 3.27 against a latent
+        # that is meant to be unit-normal, which burns out the masked region.
+        reference_model_space = model.process_latent_in(reference)
+
+        mask = _ttm_align_mask(
+            self.mask,
+            latent_shape,
+            getattr(model.latent_format, "temporal_downscale_ratio", 4),
+        ).to(noise.device)
+
+        # Translate the step window into a sigma window once, here, where the schedule is
+        # known. The per-call hook then needs no step arithmetic and stays correct for
+        # solvers that evaluate the model off-schedule.
+        last_index = min(self.end_step - self.start_step, sigmas.shape[-1] - 1)
+        sigma_start = float(sigmas[0])
+        sigma_end = float(sigmas[last_index]) if last_index >= 1 else float("inf")
+
+        transformer_options = guider.model_options.setdefault("transformer_options", {})
+        wrappers = transformer_options.setdefault("wrappers", {})
+        apply_model_wrappers = wrappers.setdefault(WrappersMP.APPLY_MODEL, {})
+        apply_model_wrappers[_TTM_APPLY_MODEL_KEY] = [
+            _TTMApplyModel(
+                reference_model_space,
+                noise,
+                mask,
+                model.model_sampling,
+                sigma_start,
+                sigma_end,
+            )
+        ]
+
+        return executor(noise, latent_image, sampler, sigmas, *args, **kwargs)
+
+
+class vloTimeToMove(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="vloTimeToMove",
+            search_aliases=["ttm", "time to move", "motion transfer", "cut and drag"],
+            display_name="vlo Time-to-Move (TTM)",
+            category="advanced/model",
+            description=(
+                "Patches a video model to follow the motion in a reference clip, as in "
+                "Time-to-Move (https://github.com/time-to-move/TTM). The reference latents "
+                "seed the sampler's starting latent, which is what carries the intended "
+                "motion, and are then blended back into the masked region for the first few "
+                "steps to hold it to the reference. Patch only the model of the sampler that "
+                "starts the schedule, and leave that sampler's start_at_step at 0."
+            ),
+            inputs=[
+                io.Model.Input("model"),
+                io.Latent.Input(
+                    "reference_latents",
+                    tooltip=(
+                        "Encoded reference video, e.g. the cut-and-drag clip. Must match the "
+                        "resolution and frame count being sampled. This replaces whatever "
+                        "latent is wired into the sampler."
+                    ),
+                ),
+                io.Mask.Input(
+                    "mask",
+                    tooltip=(
+                        "White marks the region held to the reference; black is left free for "
+                        "the model to generate. For a moving subject that means white "
+                        "background and a black hole over the subject. Pixel resolution and "
+                        "frame count are matched to the latent grid automatically."
+                    ),
+                ),
+                io.Int.Input(
+                    "start_step",
+                    default=1,
+                    min=0,
+                    max=1000,
+                    tooltip=(
+                        "Step whose noise level the reference is seeded at. The sampler skips "
+                        "the steps before it. Higher values leave less noise on the reference, "
+                        "binding the result more tightly to it at the cost of a step and of "
+                        "the model's freedom to clean up paste artifacts. 0 is a no-op: sigma "
+                        "is 1.0 there and the reference washes out entirely."
+                    ),
+                ),
+                io.Int.Input(
+                    "end_step",
+                    default=2,
+                    min=0,
+                    max=1000,
+                    tooltip=(
+                        "Last step whose input has the reference blended into the masked "
+                        "region. Set at or below start_step to seed the init only and let the "
+                        "masked region evolve freely afterwards."
+                    ),
+                ),
+            ],
+            outputs=[io.Model.Output()],
+            is_experimental=True,
+        )
+
+    @classmethod
+    def execute(cls, model, reference_latents, mask, start_step=1, end_step=2) -> io.NodeOutput:
+        patched = model.clone()
+        patched.add_wrapper_with_key(
+            WrappersMP.OUTER_SAMPLE,
+            _TTM_OUTER_SAMPLE_KEY,
+            _TTMOuterSample(reference_latents, mask, start_step, end_step),
+        )
+        return io.NodeOutput(patched)
+
+
 class vloExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[io.ComfyNode]]:
@@ -1283,6 +1538,7 @@ class vloExtension(ComfyExtension):
             vloLatentCompositeMasked,
             vloGateNone,
             vloLogicNot,
+            vloTimeToMove,
         ]
 
 
