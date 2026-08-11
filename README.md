@@ -17,6 +17,34 @@ Each loader also keeps a `disable_in_memory` toggle, which falls back to loading
 the selected file from the normal input directory — handy for testing workflows
 by hand without going through vlo.
 
+### Batch loaders
+
+The corresponding **Batch** nodes load an ordered multi-selection:
+
+- `vlo Memory Load Image Batch` outputs ordered `IMAGE` and `MASK` lists.
+- `vlo Memory Load Audio Batch` outputs an ordered `AUDIO` list.
+- `vlo Memory Load Video Batch` outputs an ordered `VIDEO` list.
+
+These are ComfyUI list outputs rather than concatenated tensors. Images may
+therefore have different dimensions, audio clips may have different durations,
+and each video remains an independent video. Downstream nodes that need the
+whole collection in one execution must opt into ComfyUI list inputs; ordinary
+nodes will execute once per list item.
+
+The batch nodes replace ComfyUI's static multi-select with an ordered selector
+owned by this extension. In the default mode it refreshes directly from vlo's
+in-memory registry. The `disable_in_memory` toggle reuses the same selector for
+files already present in `ComfyUI/input`. Arrow controls determine the exact
+list order sent downstream.
+
+Selections are capped at 100 items as a general safety bound. Model-specific
+nodes should enforce their own lower limits when consuming a collection.
+
+The vlo application does not yet inject collection-valued media inputs. That
+requires a separate application-side cardinality and upload contract; these
+nodes currently provide the ComfyUI execution and authoring primitives for that
+work.
+
 ## Installation
 
 Clone (or symlink) this repository into your ComfyUI `custom_nodes` directory and

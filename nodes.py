@@ -27,6 +27,7 @@ from comfy.patcher_extension import WrappersMP
 from comfy_api.latest import ComfyExtension, Input, InputImpl, Types, io
 from comfy_execution.utils import get_executing_context
 
+from .batch_loader_utils import normalize_memory_batch_values
 from .media_registry import (
     MediaItem,
     MediaRegistry,
@@ -223,6 +224,84 @@ def _should_load_from_filepath(raw_value: Any, *, disable_in_memory: bool) -> bo
         return False
 
     return _annotated_filepath_exists(raw_value)
+
+
+def _validate_memory_batch_values(
+    raw_values: Any,
+    *,
+    label: str,
+    expected_kind: str,
+    disable_in_memory: bool,
+) -> bool | str:
+    try:
+        values = normalize_memory_batch_values(raw_values, label=label)
+    except ValueError as exc:
+        return str(exc)
+
+    for value in values:
+        if _should_load_from_filepath(value, disable_in_memory=disable_in_memory):
+            if not folder_paths.exists_annotated_filepath(value):
+                return f"Invalid {expected_kind} file: {value}"
+            continue
+
+        item = REGISTRY.get(value, mark_accessed=False)
+        if item is None:
+            return f"Invalid {expected_kind} id: {value}"
+        if item.kind != expected_kind:
+            return (
+                f"Media id '{value}' has kind '{item.kind}', "
+                f"expected '{expected_kind}'"
+            )
+    return True
+
+
+def _fingerprint_memory_batch_values(
+    raw_values: Any,
+    *,
+    label: str,
+    expected_kind: str,
+    disable_in_memory: bool,
+    use_mtime: bool,
+) -> tuple[bool, tuple[str | float, ...]]:
+    try:
+        values = normalize_memory_batch_values(raw_values, label=label)
+    except ValueError:
+        return disable_in_memory, ("__unset__",)
+
+    fingerprints: list[str | float] = []
+    for value in values:
+        if _should_load_from_filepath(value, disable_in_memory=disable_in_memory):
+            fingerprints.append(
+                _fingerprint_annotated_filepath(value, use_mtime=use_mtime)
+            )
+            continue
+
+        item = REGISTRY.get(value, mark_accessed=False)
+        if item is None or item.kind != expected_kind:
+            fingerprints.append(value)
+        else:
+            fingerprints.append(hashlib.sha256(item.data).hexdigest())
+    return disable_in_memory, tuple(fingerprints)
+
+
+def _memory_batch_input(
+    input_id: str,
+    *,
+    display_name: str,
+    placeholder: str,
+) -> io.MultiCombo.Input:
+    # ComfyUI does not support remote options on MultiCombo. The bundled web
+    # extension replaces this inert stock widget with an ordered selector that
+    # reads the live registry/input-folder routes. Keep an empty option set here
+    # so object_info never advertises a stale or semantically wrong source.
+    return io.MultiCombo.Input(
+        input_id,
+        options=[],
+        display_name=display_name,
+        default=[],
+        placeholder=placeholder,
+        chip=True,
+    )
 
 
 def _fingerprint_annotated_filepath(raw_value: str, *, use_mtime: bool) -> str | float:
@@ -834,6 +913,224 @@ class vloMemoryLoadVideo(io.ComfyNode):
         if REGISTRY.get(normalized_file, mark_accessed=False) is None:
             return f"Invalid video id: {file}"
         return True
+
+
+class vloMemoryLoadImageBatch(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="vloMemoryLoadImageBatch",
+            display_name="vlo Memory Load Image Batch",
+            category="image",
+            description=(
+                "Loads an ordered collection of images from vlo's in-memory registry "
+                "or ComfyUI's input folder. Each output is a Comfy list item, so image "
+                "dimensions do not need to match."
+            ),
+            inputs=[
+                _memory_batch_input(
+                    "images",
+                    display_name="Images",
+                    placeholder="Select images in reference order",
+                ),
+                io.Boolean.Input(
+                    "disable_in_memory",
+                    default=False,
+                    tooltip=(
+                        "When true, load every selection from ComfyUI's normal input "
+                        "directory instead of the vlo in-memory registry."
+                    ),
+                ),
+            ],
+            outputs=[
+                io.Image.Output(
+                    display_name="images",
+                    tooltip="Ordered image list.",
+                    is_output_list=True,
+                ),
+                io.Mask.Output(
+                    display_name="masks",
+                    tooltip="Masks in the same order as the image list.",
+                    is_output_list=True,
+                ),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, images, disable_in_memory=False) -> io.NodeOutput:
+        values = normalize_memory_batch_values(images, label="image")
+        output_images: list[torch.Tensor] = []
+        output_masks: list[torch.Tensor] = []
+        for value in values:
+            if _should_load_from_filepath(value, disable_in_memory=disable_in_memory):
+                image_path = folder_paths.get_annotated_filepath(value)
+                image, mask = _load_image_from_filepath(image_path)
+            else:
+                item = _get_media_item(value, expected_kind="image")
+                image, mask = _load_image_from_bytes(item.data)
+            output_images.append(image)
+            output_masks.append(mask)
+        return io.NodeOutput(output_images, output_masks)
+
+    @classmethod
+    def fingerprint_inputs(cls, images, disable_in_memory=False):
+        return _fingerprint_memory_batch_values(
+            images,
+            label="image",
+            expected_kind="image",
+            disable_in_memory=disable_in_memory,
+            use_mtime=False,
+        )
+
+    @classmethod
+    def validate_inputs(cls, images, disable_in_memory=False):
+        return _validate_memory_batch_values(
+            images,
+            label="image",
+            expected_kind="image",
+            disable_in_memory=disable_in_memory,
+        )
+
+
+class vloMemoryLoadAudioBatch(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="vloMemoryLoadAudioBatch",
+            display_name="vlo Memory Load Audio Batch",
+            category="audio",
+            description=(
+                "Loads an ordered collection of audio clips from vlo's in-memory "
+                "registry or ComfyUI's input folder as a Comfy list."
+            ),
+            inputs=[
+                _memory_batch_input(
+                    "audios",
+                    display_name="Audio clips",
+                    placeholder="Select audio clips in reference order",
+                ),
+                io.Boolean.Input(
+                    "disable_in_memory",
+                    default=False,
+                    tooltip=(
+                        "When true, load every selection from ComfyUI's normal input "
+                        "directory instead of the vlo in-memory registry."
+                    ),
+                ),
+            ],
+            outputs=[
+                io.Audio.Output(
+                    display_name="audios",
+                    tooltip="Ordered audio list.",
+                    is_output_list=True,
+                )
+            ],
+        )
+
+    @classmethod
+    def execute(cls, audios, disable_in_memory=False) -> io.NodeOutput:
+        values = normalize_memory_batch_values(audios, label="audio clip")
+        output: list[dict[str, Any]] = []
+        for value in values:
+            if _should_load_from_filepath(value, disable_in_memory=disable_in_memory):
+                audio_path = folder_paths.get_annotated_filepath(value)
+                waveform, sample_rate = _load_audio_from_filepath(audio_path)
+            else:
+                item = _get_media_item(value, expected_kind="audio")
+                waveform, sample_rate = _load_audio_from_bytes(item.data)
+            output.append(
+                {"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate}
+            )
+        return io.NodeOutput(output)
+
+    @classmethod
+    def fingerprint_inputs(cls, audios, disable_in_memory=False):
+        return _fingerprint_memory_batch_values(
+            audios,
+            label="audio clip",
+            expected_kind="audio",
+            disable_in_memory=disable_in_memory,
+            use_mtime=False,
+        )
+
+    @classmethod
+    def validate_inputs(cls, audios, disable_in_memory=False):
+        return _validate_memory_batch_values(
+            audios,
+            label="audio clip",
+            expected_kind="audio",
+            disable_in_memory=disable_in_memory,
+        )
+
+
+class vloMemoryLoadVideoBatch(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="vloMemoryLoadVideoBatch",
+            display_name="vlo Memory Load Video Batch",
+            category="image/video",
+            description=(
+                "Loads an ordered collection of videos from vlo's in-memory registry "
+                "or ComfyUI's input folder as a Comfy list."
+            ),
+            inputs=[
+                _memory_batch_input(
+                    "files",
+                    display_name="Videos",
+                    placeholder="Select videos in reference order",
+                ),
+                io.Boolean.Input(
+                    "disable_in_memory",
+                    default=False,
+                    tooltip=(
+                        "When true, load every selection from ComfyUI's normal input "
+                        "directory instead of the vlo in-memory registry."
+                    ),
+                ),
+            ],
+            outputs=[
+                io.Video.Output(
+                    display_name="videos",
+                    tooltip="Ordered video list.",
+                    is_output_list=True,
+                )
+            ],
+        )
+
+    @classmethod
+    def execute(cls, files, disable_in_memory=False) -> io.NodeOutput:
+        values = normalize_memory_batch_values(files, label="video")
+        output: list[Input.Video] = []
+        for value in values:
+            if _should_load_from_filepath(value, disable_in_memory=disable_in_memory):
+                video_path = folder_paths.get_annotated_filepath(value)
+                output.append(InputImpl.VideoFromFile(video_path))
+            else:
+                item = _get_media_item(value, expected_kind="video")
+                output.append(
+                    InputImpl.VideoFromFile(stdlib_io.BytesIO(item.data))
+                )
+        return io.NodeOutput(output)
+
+    @classmethod
+    def fingerprint_inputs(cls, files, disable_in_memory=False):
+        return _fingerprint_memory_batch_values(
+            files,
+            label="video",
+            expected_kind="video",
+            disable_in_memory=disable_in_memory,
+            use_mtime=True,
+        )
+
+    @classmethod
+    def validate_inputs(cls, files, disable_in_memory=False):
+        return _validate_memory_batch_values(
+            files,
+            label="video",
+            expected_kind="video",
+            disable_in_memory=disable_in_memory,
+        )
 
 
 class vloVideoConvertFps(io.ComfyNode):
@@ -1517,6 +1814,9 @@ class vloExtension(ComfyExtension):
             vloMemoryLoadImage,
             vloMemoryLoadAudio,
             vloMemoryLoadVideo,
+            vloMemoryLoadImageBatch,
+            vloMemoryLoadAudioBatch,
+            vloMemoryLoadVideoBatch,
             vloVideoConvertFps,
             vloSaveImageWebsocketBMP,
             vloSaveVideoWebsocket,
