@@ -45,6 +45,24 @@ requires a separate application-side cardinality and upload contract; these
 nodes currently provide the ComfyUI execution and authoring primitives for that
 work.
 
+### MiniMax H3 batch adapter
+
+`vlo MiniMax H3 Reference to Video (Batch)` wraps ComfyUI's native MiniMax H3
+reference-conditioning node so the three batch loaders can feed it directly.
+It consumes each connected list in one execution and preserves its order. The
+wrapper reads reference limits and socket prefixes from the installed native
+node schema, and stops with a compatibility error if that contract changes.
+
+The adapter converts each `VIDEO` to the native node's expected 24 fps image
+frames. Audio embedded in a video is used as its soundtrack automatically. An
+ordered `AUDIO` list connected to `ref_video_audios` overrides those soundtracks
+positionally; omitted override entries continue to use the embedded audio.
+The `ref_audios` socket is for standalone audio references.
+
+The wrapper expands to a real native node in the execution graph rather than
+calling its Python method directly. ComfyUI therefore applies the native node's
+normal V3 lifecycle, validation, caching, and resource handling.
+
 ## Installation
 
 Clone (or symlink) this repository into your ComfyUI `custom_nodes` directory and

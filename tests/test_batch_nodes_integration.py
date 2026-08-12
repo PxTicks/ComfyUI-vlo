@@ -5,9 +5,11 @@ import io
 import os
 import sys
 import types
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
+import torch
 from PIL import Image
 
 
@@ -139,3 +141,256 @@ def test_image_batch_executes_independent_image_sizes_in_order(nodes_module) -> 
         (1, 9, 5, 3),
     ]
     assert len(masks) == 2
+
+
+def test_minimax_batch_adapter_schema_accepts_comfy_lists(nodes_module) -> None:
+    node_class = nodes_module.vloMiniMaxH3ReferenceToVideoBatch
+    schema = node_class.GET_SCHEMA()
+
+    assert node_class.INPUT_IS_LIST is True
+    assert [input_spec.id for input_spec in schema.inputs[-4:]] == [
+        "ref_images",
+        "ref_videos",
+        "ref_video_audios",
+        "ref_audios",
+    ]
+    assert [input_spec.io_type for input_spec in schema.inputs[-4:]] == [
+        "IMAGE",
+        "VIDEO",
+        "AUDIO",
+        "AUDIO",
+    ]
+    assert schema.enable_expand is True
+
+
+def _fake_native_minimax_node(
+    nodes_module,
+    *,
+    image_max: int = 9,
+    video_max: int = 3,
+    video_audio_max: int = 3,
+    audio_max: int = 3,
+):
+    class FakeNativeMiniMaxNode:
+        @classmethod
+        def GET_SCHEMA(cls):
+            return nodes_module.io.Schema(
+                node_id="MiniMaxH3ReferenceToVideo",
+                inputs=[
+                    nodes_module.io.Clip.Input("clip"),
+                    nodes_module.io.Vae.Input("vae"),
+                    nodes_module.io.Vae.Input("audio_vae"),
+                    nodes_module.io.String.Input("prompt"),
+                    nodes_module.io.Int.Input("width"),
+                    nodes_module.io.Int.Input("height"),
+                    nodes_module.io.Int.Input("length"),
+                    nodes_module.io.Combo.Input(
+                        "ref_image_size",
+                        options=["match", "max"],
+                    ),
+                    nodes_module.io.Autogrow.Input(
+                        "ref_images",
+                        optional=True,
+                        template=nodes_module.io.Autogrow.TemplatePrefix(
+                            input=nodes_module.io.Image.Input("ref_image"),
+                            prefix="native_picture_",
+                            min=0,
+                            max=image_max,
+                        ),
+                    ),
+                    nodes_module.io.Autogrow.Input(
+                        "ref_videos",
+                        optional=True,
+                        template=nodes_module.io.Autogrow.TemplatePrefix(
+                            input=nodes_module.io.Image.Input("ref_video"),
+                            prefix="native_video_",
+                            min=0,
+                            max=video_max,
+                        ),
+                    ),
+                    nodes_module.io.Autogrow.Input(
+                        "ref_video_audios",
+                        optional=True,
+                        template=nodes_module.io.Autogrow.TemplatePrefix(
+                            input=nodes_module.io.Audio.Input("ref_video_audio"),
+                            prefix="native_soundtrack_",
+                            min=0,
+                            max=video_audio_max,
+                        ),
+                    ),
+                    nodes_module.io.Autogrow.Input(
+                        "ref_audios",
+                        optional=True,
+                        template=nodes_module.io.Autogrow.TemplatePrefix(
+                            input=nodes_module.io.Audio.Input("ref_audio"),
+                            prefix="native_audio_",
+                            min=0,
+                            max=audio_max,
+                        ),
+                    ),
+                ],
+                outputs=[
+                    nodes_module.io.Conditioning.Output(),
+                    nodes_module.io.Latent.Output(),
+                ],
+            )
+
+    return FakeNativeMiniMaxNode
+
+
+def _expanded_native_node(result):
+    assert result.expand is not None
+    assert len(result.expand) == 1
+    node_id, node = next(iter(result.expand.items()))
+    assert result.result == ([node_id, 0], [node_id, 1])
+    return node
+
+
+def test_minimax_batch_adapter_expands_ordered_native_inputs(
+    nodes_module,
+    monkeypatch,
+) -> None:
+    embedded_audio = {"waveform": torch.zeros(1, 2, 10), "sample_rate": 32000}
+    override_audio = {"waveform": torch.ones(1, 2, 10), "sample_rate": 32000}
+    standalone_audio = {"waveform": torch.full((1, 2, 10), 2.0), "sample_rate": 32000}
+
+    class FakeVideo:
+        def get_components(self):
+            return types.SimpleNamespace(
+                images=torch.arange(8 * 2 * 3 * 3, dtype=torch.float32).reshape(
+                    8, 2, 3, 3
+                ),
+                frame_rate=Fraction(12, 1),
+                audio=embedded_audio,
+            )
+
+    monkeypatch.setattr(
+        nodes_module,
+        "_get_native_minimax_h3_reference_node",
+        lambda: _fake_native_minimax_node(nodes_module),
+    )
+
+    first_image = torch.zeros(1, 4, 5, 3)
+    second_image = torch.ones(1, 6, 7, 3)
+    result = nodes_module.vloMiniMaxH3ReferenceToVideoBatch.execute(
+        clip=["clip"],
+        vae=["vae"],
+        audio_vae=["audio-vae"],
+        prompt=["<Picture 1> and <Video 1>"],
+        width=[1344],
+        height=[768],
+        length=[124],
+        ref_image_size=["match"],
+        ref_images=[first_image, second_image],
+        ref_videos=[FakeVideo()],
+        ref_video_audios=[override_audio],
+        ref_audios=[standalone_audio],
+    )
+
+    expanded = _expanded_native_node(result)
+    assert expanded["class_type"] == "MiniMaxH3ReferenceToVideo"
+    native_inputs = expanded["inputs"]
+    assert native_inputs["native_picture_0"] is first_image
+    assert native_inputs["native_picture_1"] is second_image
+    assert native_inputs["native_video_0"].shape[0] == 16
+    assert native_inputs["native_soundtrack_0"] is override_audio
+    assert native_inputs["native_audio_0"] is standalone_audio
+    assert native_inputs["prompt"] == "<Picture 1> and <Video 1>"
+    assert "native_picture_2" not in native_inputs
+
+
+def test_minimax_batch_adapter_uses_embedded_audio_and_schema_limits(
+    nodes_module,
+    monkeypatch,
+) -> None:
+    embedded_audio = {"waveform": torch.zeros(1, 2, 10), "sample_rate": 32000}
+
+    class FakeVideo:
+        def get_components(self):
+            return types.SimpleNamespace(
+                images=torch.zeros(5, 2, 3, 3),
+                frame_rate=Fraction(24, 1),
+                audio=embedded_audio,
+            )
+
+    monkeypatch.setattr(
+        nodes_module,
+        "_get_native_minimax_h3_reference_node",
+        lambda: _fake_native_minimax_node(nodes_module, image_max=2),
+    )
+    base_args = {
+        "clip": ["clip"],
+        "vae": ["vae"],
+        "audio_vae": ["audio-vae"],
+        "prompt": ["prompt"],
+        "width": [1344],
+        "height": [768],
+        "length": [124],
+        "ref_image_size": ["match"],
+    }
+
+    result = nodes_module.vloMiniMaxH3ReferenceToVideoBatch.execute(
+        **base_args,
+        ref_videos=[FakeVideo()],
+    )
+    expanded = _expanded_native_node(result)
+    assert expanded["inputs"]["native_soundtrack_0"] is embedded_audio
+
+    with pytest.raises(ValueError, match="at most 2 reference images"):
+        nodes_module.vloMiniMaxH3ReferenceToVideoBatch.execute(
+            **base_args,
+            ref_images=[torch.zeros(1, 1, 1, 3)] * 3,
+        )
+
+    with pytest.raises(ValueError, match="cannot outnumber reference videos"):
+        nodes_module.vloMiniMaxH3ReferenceToVideoBatch.execute(
+            **base_args,
+            ref_video_audios=[embedded_audio],
+        )
+
+    monkeypatch.setattr(
+        nodes_module,
+        "_get_native_minimax_h3_reference_node",
+        lambda: _fake_native_minimax_node(
+            nodes_module,
+            video_max=2,
+            video_audio_max=1,
+        ),
+    )
+    with pytest.raises(ValueError, match="at most 1 reference video soundtrack"):
+        nodes_module.vloMiniMaxH3ReferenceToVideoBatch.execute(
+            **base_args,
+            ref_videos=[FakeVideo(), FakeVideo()],
+        )
+
+
+def test_minimax_batch_adapter_rejects_native_schema_drift(
+    nodes_module,
+    monkeypatch,
+) -> None:
+    native_node = _fake_native_minimax_node(nodes_module)
+    original_get_schema = native_node.GET_SCHEMA
+
+    @classmethod
+    def incompatible_schema(cls):
+        schema = original_get_schema()
+        ref_videos = next(
+            input_spec
+            for input_spec in schema.inputs
+            if input_spec.id == "ref_videos"
+        )
+        ref_videos.template.input = nodes_module.io.Video.Input("ref_video")
+        return schema
+
+    native_node.GET_SCHEMA = incompatible_schema
+    monkeypatch.setattr(
+        nodes_module,
+        "_get_native_minimax_h3_reference_node",
+        lambda: native_node,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="ref_videos.*expected IMAGE, got VIDEO",
+    ):
+        nodes_module._get_native_minimax_h3_reference_contract()
