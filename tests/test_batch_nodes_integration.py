@@ -148,18 +148,19 @@ def test_minimax_batch_adapter_schema_accepts_comfy_lists(nodes_module) -> None:
     schema = node_class.GET_SCHEMA()
 
     assert node_class.INPUT_IS_LIST is True
-    assert [input_spec.id for input_spec in schema.inputs[-4:]] == [
-        "ref_images",
-        "ref_videos",
-        "ref_video_audios",
-        "ref_audios",
-    ]
-    assert [input_spec.io_type for input_spec in schema.inputs[-4:]] == [
-        "IMAGE",
-        "VIDEO",
-        "AUDIO",
-        "AUDIO",
-    ]
+    io_types = {input_spec.id: input_spec.io_type for input_spec in schema.inputs}
+    assert {
+        name: io_types.get(name)
+        for name in ("ref_images", "ref_videos", "ref_video_audios", "ref_audios")
+    } == {
+        "ref_images": "IMAGE",
+        "ref_videos": "VIDEO",
+        "ref_video_audios": "AUDIO",
+        "ref_audios": "AUDIO",
+    }
+    # Per-video audio gating rides a BOOLEAN input so a single widget value and a
+    # connected per-video list both work without a schema change.
+    assert io_types.get("use_embedded_video_audio") == "BOOLEAN"
     assert schema.enable_expand is True
 
 
@@ -332,6 +333,7 @@ def test_minimax_batch_adapter_uses_embedded_audio_and_schema_limits(
     result = nodes_module.vloMiniMaxH3ReferenceToVideoBatch.execute(
         **base_args,
         ref_videos=[FakeVideo()],
+        use_embedded_video_audio=[True],
     )
     expanded = _expanded_native_node(result)
     assert expanded["inputs"]["native_soundtrack_0"] is embedded_audio
@@ -361,6 +363,84 @@ def test_minimax_batch_adapter_uses_embedded_audio_and_schema_limits(
         nodes_module.vloMiniMaxH3ReferenceToVideoBatch.execute(
             **base_args,
             ref_videos=[FakeVideo(), FakeVideo()],
+            use_embedded_video_audio=[True],
+        )
+
+
+def test_minimax_batch_adapter_gates_embedded_audio_per_video(
+    nodes_module,
+    monkeypatch,
+) -> None:
+    first_audio = {"waveform": torch.zeros(1, 2, 10), "sample_rate": 32000}
+    second_audio = {"waveform": torch.ones(1, 2, 10), "sample_rate": 32000}
+    override_audio = {"waveform": torch.full((1, 2, 10), 2.0), "sample_rate": 32000}
+
+    def fake_video(audio):
+        class FakeVideo:
+            def get_components(self):
+                return types.SimpleNamespace(
+                    images=torch.zeros(5, 2, 3, 3),
+                    frame_rate=Fraction(24, 1),
+                    audio=audio,
+                )
+
+        return FakeVideo()
+
+    monkeypatch.setattr(
+        nodes_module,
+        "_get_native_minimax_h3_reference_node",
+        lambda: _fake_native_minimax_node(nodes_module),
+    )
+    base_args = {
+        "clip": ["clip"],
+        "vae": ["vae"],
+        "audio_vae": ["audio-vae"],
+        "prompt": ["prompt"],
+        "width": [1344],
+        "height": [768],
+        "length": [124],
+        "ref_image_size": ["match"],
+    }
+
+    def soundtracks(**kwargs):
+        result = nodes_module.vloMiniMaxH3ReferenceToVideoBatch.execute(
+            **base_args, **kwargs
+        )
+        inputs = _expanded_native_node(result)["inputs"]
+        return {
+            name: value
+            for name, value in inputs.items()
+            if name.startswith("native_soundtrack_")
+        }
+
+    videos = [fake_video(first_audio), fake_video(second_audio)]
+
+    # Off by default: a reference video's own sound is not an <Audio N> reference.
+    assert soundtracks(ref_videos=videos) == {}
+
+    # A single widget value broadcasts to every video.
+    assert soundtracks(ref_videos=videos, use_embedded_video_audio=[True]) == {
+        "native_soundtrack_0": first_audio,
+        "native_soundtrack_1": second_audio,
+    }
+
+    # A per-video list binds positionally, leaving a hole for the disabled video.
+    assert soundtracks(
+        ref_videos=videos, use_embedded_video_audio=[False, True]
+    ) == {"native_soundtrack_1": second_audio}
+
+    # An explicit override still wins for a video with embedded audio disabled.
+    assert soundtracks(
+        ref_videos=videos,
+        ref_video_audios=[override_audio],
+        use_embedded_video_audio=[False, False],
+    ) == {"native_soundtrack_0": override_audio}
+
+    with pytest.raises(ValueError, match="one value per reference video"):
+        nodes_module.vloMiniMaxH3ReferenceToVideoBatch.execute(
+            **base_args,
+            ref_videos=videos,
+            use_embedded_video_audio=[True, False, True],
         )
 
 

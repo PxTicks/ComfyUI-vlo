@@ -54,10 +54,31 @@ wrapper reads reference limits and socket prefixes from the installed native
 node schema, and stops with a compatibility error if that contract changes.
 
 The adapter converts each `VIDEO` to the native node's expected 24 fps image
-frames. Audio embedded in a video is used as its soundtrack automatically. An
-ordered `AUDIO` list connected to `ref_video_audios` overrides those soundtracks
-positionally; omitted override entries continue to use the embedded audio.
-The `ref_audios` socket is for standalone audio references.
+frames. The `ref_audios` socket is for standalone audio references.
+
+#### Reference video audio
+
+MiniMax treats a reference video's own soundtrack as a separate `<Audio N>`
+reference that has to be enabled: an ordinary reference video does not become an
+audio reference merely because its file contains sound. Enabling one also
+consumes an `<Audio N>` ordinal, which shifts the numbering of every later audio
+tag, because `<Video N>` and `<Audio N>` are numbered independently and the
+indices do not encode the pairing. The association is carried structurally, not
+by the tag numbers.
+
+`use_embedded_video_audio` therefore defaults to off. It accepts either form:
+
+- a single value, which applies to every reference video;
+- a `BOOLEAN` list with one entry per reference video, bound positionally.
+
+Both work because the node uses Comfy list inputs, so a widget arrives as a
+one-item list and a connected list arrives with one entry per video. Per-video
+gating needs no schema change when it is driven from a real per-video source.
+
+An `AUDIO` list connected to `ref_video_audios` overrides soundtracks
+positionally and always wins, whether or not embedded audio is enabled for that
+video. Videos with neither an override nor enabled embedded audio are passed as
+video-only references.
 
 The wrapper expands to a real native node in the execution graph rather than
 calling its Python method directly. ComfyUI therefore applies the native node's

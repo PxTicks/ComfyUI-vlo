@@ -1178,6 +1178,30 @@ def _enforce_reference_limit(values: list[Any], *, label: str, maximum: int) -> 
         )
 
 
+def _resolve_per_video_flags(
+    raw_flags: Any,
+    *,
+    count: int,
+    label: str,
+    default: bool,
+) -> list[bool]:
+    # `is_input_list=True` means a widget arrives as a one-item list while a
+    # connected BOOLEAN list arrives with one entry per video. Broadcasting the
+    # single-value case is what lets vlo move from one node-wide toggle to
+    # per-upload tickboxes later without a schema change or a node_id bump.
+    flags = _normalize_list_input(raw_flags)
+    if not flags:
+        return [default] * count
+    if len(flags) == 1:
+        return [bool(flags[0])] * count
+    if len(flags) != count:
+        raise ValueError(
+            f"{label} expects a single value, or one value per reference video; "
+            f"received {len(flags)} for {count} videos"
+        )
+    return [bool(flag) for flag in flags]
+
+
 def _get_native_minimax_h3_reference_node() -> type[io.ComfyNode]:
     # Keep MiniMax's model stack out of this extension's import path. Besides
     # reducing startup coupling, this lets the other VLO nodes keep working on
@@ -1337,12 +1361,24 @@ class vloMiniMaxH3ReferenceToVideoBatch(io.ComfyNode):
                         "native node's required 24 fps. Limit follows the native node."
                     ),
                 ),
+                io.Boolean.Input(
+                    "use_embedded_video_audio",
+                    default=False,
+                    tooltip=(
+                        "Use the audio embedded in each reference video as its "
+                        "soundtrack. MiniMax treats a reference video's own sound as "
+                        "a separate <Audio N> reference that must be enabled, so this "
+                        "is off by default. Connect a BOOLEAN list to set it per "
+                        "video; a single value applies to every video."
+                    ),
+                ),
                 io.Audio.Input(
                     "ref_video_audios",
                     optional=True,
                     tooltip=(
                         "Optional ordered soundtrack overrides for the reference videos. "
-                        "Missing entries use audio embedded in each video."
+                        "An override always wins, whether or not embedded audio is "
+                        "enabled for that video."
                     ),
                 ),
                 io.Audio.Input(
@@ -1373,6 +1409,7 @@ class vloMiniMaxH3ReferenceToVideoBatch(io.ComfyNode):
         ref_image_size="match",
         ref_images=None,
         ref_videos=None,
+        use_embedded_video_audio=False,
         ref_video_audios=None,
         ref_audios=None,
     ) -> io.NodeOutput:
@@ -1419,6 +1456,13 @@ class vloMiniMaxH3ReferenceToVideoBatch(io.ComfyNode):
             f"{image_prefix}{index}": image
             for index, image in enumerate(images)
         }
+        embedded_audio_flags = _resolve_per_video_flags(
+            use_embedded_video_audio,
+            count=len(videos),
+            label="use_embedded_video_audio",
+            default=False,
+        )
+
         native_videos: dict[str, torch.Tensor] = {}
         native_video_audios: dict[str, Any] = {}
         for index, video in enumerate(videos):
@@ -1428,11 +1472,12 @@ class vloMiniMaxH3ReferenceToVideoBatch(io.ComfyNode):
                 source_fps=components.frame_rate,
                 target_fps=Fraction(24, 1),
             )
-            soundtrack = (
-                video_audio_overrides[index]
-                if index < len(video_audio_overrides)
-                else components.audio
-            )
+            if index < len(video_audio_overrides):
+                soundtrack = video_audio_overrides[index]
+            elif embedded_audio_flags[index]:
+                soundtrack = components.audio
+            else:
+                soundtrack = None
             if soundtrack is not None:
                 native_video_audios[f"{video_audio_prefix}{index}"] = soundtrack
         _enforce_reference_limit(
