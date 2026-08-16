@@ -247,6 +247,30 @@ def _expanded_native_node(result):
     return node
 
 
+def _finalize_expanded_native_inputs(native_node, expanded):
+    # Exercise the same V3 dynamic-input finalization that ComfyUI runs before
+    # invoking the expanded node. Autogrow members are only recognized when the
+    # GraphBuilder key includes the parent input id (for example,
+    # `ref_audios.ref_audio_0`).
+    from comfy_api.latest import _io
+
+    raw_inputs = expanded["inputs"]
+    class_inputs = _io.create_input_dict_v1(native_node.GET_SCHEMA().inputs)
+    finalized, _, v3_data = _io.get_finalized_class_inputs(
+        class_inputs,
+        raw_inputs,
+    )
+    recognized_ids = set(finalized.get("required", {})) | set(
+        finalized.get("optional", {})
+    )
+    execution_inputs = {
+        input_id: value
+        for input_id, value in raw_inputs.items()
+        if input_id in recognized_ids
+    }
+    return _io.build_nested_inputs(execution_inputs, v3_data)
+
+
 def test_minimax_batch_adapter_expands_ordered_native_inputs(
     nodes_module,
     monkeypatch,
@@ -265,10 +289,11 @@ def test_minimax_batch_adapter_expands_ordered_native_inputs(
                 audio=embedded_audio,
             )
 
+    native_node = _fake_native_minimax_node(nodes_module)
     monkeypatch.setattr(
         nodes_module,
         "_get_native_minimax_h3_reference_node",
-        lambda: _fake_native_minimax_node(nodes_module),
+        lambda: native_node,
     )
 
     first_image = torch.zeros(1, 4, 5, 3)
@@ -291,13 +316,29 @@ def test_minimax_batch_adapter_expands_ordered_native_inputs(
     expanded = _expanded_native_node(result)
     assert expanded["class_type"] == "MiniMaxH3ReferenceToVideo"
     native_inputs = expanded["inputs"]
-    assert native_inputs["native_picture_0"] is first_image
-    assert native_inputs["native_picture_1"] is second_image
-    assert native_inputs["native_video_0"].shape[0] == 16
-    assert native_inputs["native_soundtrack_0"] is override_audio
-    assert native_inputs["native_audio_0"] is standalone_audio
+    assert native_inputs["ref_images.native_picture_0"] is first_image
+    assert native_inputs["ref_images.native_picture_1"] is second_image
+    assert native_inputs["ref_videos.native_video_0"].shape[0] == 16
+    assert (
+        native_inputs["ref_video_audios.native_soundtrack_0"] is override_audio
+    )
+    assert native_inputs["ref_audios.native_audio_0"] is standalone_audio
     assert native_inputs["prompt"] == "<Picture 1> and <Video 1>"
-    assert "native_picture_2" not in native_inputs
+    assert "ref_images.native_picture_2" not in native_inputs
+
+    finalized_inputs = _finalize_expanded_native_inputs(native_node, expanded)
+    assert set(finalized_inputs["ref_images"]) == {
+        "native_picture_0",
+        "native_picture_1",
+    }
+    assert finalized_inputs["ref_images"]["native_picture_0"] is first_image
+    assert finalized_inputs["ref_images"]["native_picture_1"] is second_image
+    assert finalized_inputs["ref_videos"]["native_video_0"].shape[0] == 16
+    assert (
+        finalized_inputs["ref_video_audios"]["native_soundtrack_0"]
+        is override_audio
+    )
+    assert finalized_inputs["ref_audios"]["native_audio_0"] is standalone_audio
 
 
 def test_minimax_batch_adapter_uses_embedded_audio_and_schema_limits(
@@ -336,7 +377,10 @@ def test_minimax_batch_adapter_uses_embedded_audio_and_schema_limits(
         use_embedded_video_audio=[True],
     )
     expanded = _expanded_native_node(result)
-    assert expanded["inputs"]["native_soundtrack_0"] is embedded_audio
+    assert (
+        expanded["inputs"]["ref_video_audios.native_soundtrack_0"]
+        is embedded_audio
+    )
 
     with pytest.raises(ValueError, match="at most 2 reference images"):
         nodes_module.vloMiniMaxH3ReferenceToVideoBatch.execute(
@@ -410,7 +454,7 @@ def test_minimax_batch_adapter_gates_embedded_audio_per_video(
         return {
             name: value
             for name, value in inputs.items()
-            if name.startswith("native_soundtrack_")
+            if name.startswith("ref_video_audios.native_soundtrack_")
         }
 
     videos = [fake_video(first_audio), fake_video(second_audio)]
@@ -420,21 +464,21 @@ def test_minimax_batch_adapter_gates_embedded_audio_per_video(
 
     # A single widget value broadcasts to every video.
     assert soundtracks(ref_videos=videos, use_embedded_video_audio=[True]) == {
-        "native_soundtrack_0": first_audio,
-        "native_soundtrack_1": second_audio,
+        "ref_video_audios.native_soundtrack_0": first_audio,
+        "ref_video_audios.native_soundtrack_1": second_audio,
     }
 
     # A per-video list binds positionally, leaving a hole for the disabled video.
     assert soundtracks(
         ref_videos=videos, use_embedded_video_audio=[False, True]
-    ) == {"native_soundtrack_1": second_audio}
+    ) == {"ref_video_audios.native_soundtrack_1": second_audio}
 
     # An explicit override still wins for a video with embedded audio disabled.
     assert soundtracks(
         ref_videos=videos,
         ref_video_audios=[override_audio],
         use_embedded_video_audio=[False, False],
-    ) == {"native_soundtrack_0": override_audio}
+    ) == {"ref_video_audios.native_soundtrack_0": override_audio}
 
     with pytest.raises(ValueError, match="one value per reference video"):
         nodes_module.vloMiniMaxH3ReferenceToVideoBatch.execute(

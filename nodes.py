@@ -1453,7 +1453,7 @@ class vloMiniMaxH3ReferenceToVideoBatch(io.ComfyNode):
             )
 
         native_images = {
-            f"{image_prefix}{index}": image
+            f"ref_images.{image_prefix}{index}": image
             for index, image in enumerate(images)
         }
         embedded_audio_flags = _resolve_per_video_flags(
@@ -1467,7 +1467,9 @@ class vloMiniMaxH3ReferenceToVideoBatch(io.ComfyNode):
         native_video_audios: dict[str, Any] = {}
         for index, video in enumerate(videos):
             components = video.get_components()
-            native_videos[f"{video_prefix}{index}"] = _resample_frame_tensor_to_fps(
+            native_videos[
+                f"ref_videos.{video_prefix}{index}"
+            ] = _resample_frame_tensor_to_fps(
                 components.images,
                 source_fps=components.frame_rate,
                 target_fps=Fraction(24, 1),
@@ -1479,7 +1481,9 @@ class vloMiniMaxH3ReferenceToVideoBatch(io.ComfyNode):
             else:
                 soundtrack = None
             if soundtrack is not None:
-                native_video_audios[f"{video_audio_prefix}{index}"] = soundtrack
+                native_video_audios[
+                    f"ref_video_audios.{video_audio_prefix}{index}"
+                ] = soundtrack
         _enforce_reference_limit(
             list(native_video_audios.values()),
             label="reference video soundtrack",
@@ -1487,7 +1491,7 @@ class vloMiniMaxH3ReferenceToVideoBatch(io.ComfyNode):
         )
 
         native_audios = {
-            f"{audio_prefix}{index}": audio
+            f"ref_audios.{audio_prefix}{index}": audio
             for index, audio in enumerate(audios)
         }
         graph = GraphBuilder()
