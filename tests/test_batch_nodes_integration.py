@@ -101,7 +101,7 @@ def test_batch_node_schemas_publish_comfy_list_outputs(nodes_module) -> None:
     expected = (
         (nodes_module.vloMemoryLoadImageBatch, ["IMAGE", "MASK"], [True, True]),
         (nodes_module.vloMemoryLoadAudioBatch, ["AUDIO"], [True]),
-        (nodes_module.vloMemoryLoadVideoBatch, ["VIDEO"], [True]),
+        (nodes_module.vloMemoryLoadVideoBatch, ["VIDEO", "BOOLEAN"], [True, True]),
     )
 
     for node_class, return_types, output_is_list in expected:
@@ -141,6 +141,59 @@ def test_image_batch_executes_independent_image_sizes_in_order(nodes_module) -> 
         (1, 9, 5, 3),
     ]
     assert len(masks) == 2
+
+
+def test_video_batch_emits_audio_flags_aligned_with_its_videos(
+    nodes_module,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        nodes_module.InputImpl,
+        "VideoFromFile",
+        lambda source: ("video", source),
+    )
+    media_ids = [
+        nodes_module.REGISTRY.register(
+            kind="video",
+            filename=f"clip-{index}.mp4",
+            content_type="video/mp4",
+            data=f"clip-{index}".encode(),
+        ).media_id
+        for index in range(3)
+    ]
+
+    node_class = nodes_module.vloMemoryLoadVideoBatch
+    videos, audio_flags = node_class.execute(
+        media_ids, include_audio="0,1"
+    ).result
+
+    assert len(videos) == 3
+    # One flag per video, defaulting the item the user never toggled.
+    assert audio_flags == [False, True, False]
+    assert node_class.execute(media_ids).result[1] == [False, False, False]
+
+
+def test_video_batch_reports_flag_problems_and_fingerprints_them(
+    nodes_module,
+) -> None:
+    media_id = nodes_module.REGISTRY.register(
+        kind="video",
+        filename="clip.mp4",
+        content_type="video/mp4",
+        data=b"clip",
+    ).media_id
+
+    node_class = nodes_module.vloMemoryLoadVideoBatch
+    assert node_class.validate_inputs([media_id], include_audio="1") is True
+    assert (
+        node_class.validate_inputs([media_id], include_audio="1,1")
+        == "Video audio inclusion has 2 flags for 1 items"
+    )
+
+    # Flipping a flag has to invalidate the cached execution.
+    assert node_class.fingerprint_inputs(
+        [media_id], include_audio="1"
+    ) != node_class.fingerprint_inputs([media_id], include_audio="0")
 
 
 def test_minimax_batch_adapter_schema_accepts_comfy_lists(nodes_module) -> None:

@@ -2,9 +2,11 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
 import {
+    formatBatchFlags,
     getBatchSourceRoute,
     MAX_BATCH_SELECTION_ITEMS,
     moveBatchSelection,
+    normalizeBatchFlags,
     normalizeBatchSelection,
 } from "./batch_selector_utils.mjs";
 
@@ -23,6 +25,10 @@ const BATCH_NODE_CONFIGS = {
         kind: "video",
         inputWidget: "files",
         itemLabel: "video",
+        // Per-item switch delivered next to the ordered media, mirroring the
+        // speaker toggles vlo shows on each item of its batch slot.
+        flagWidget: "include_audio",
+        flagTitle: "Use this video's audio as a reference",
     },
 };
 
@@ -64,7 +70,7 @@ function replaceWidgetAtIndex(node, originalWidget, replacementFactory) {
     return replacement;
 }
 
-function createOrderedBatchSelector(node, config, toggleWidget, initialValue) {
+function createOrderedBatchSelector(node, config, toggleWidget, flagWidget, initialValue) {
     const root = document.createElement("div");
     root.className = "vlo-batch-selector";
     root.style.setProperty("--comfy-widget-min-height", "210px");
@@ -181,8 +187,23 @@ function createOrderedBatchSelector(node, config, toggleWidget, initialValue) {
     const sourceLabel = () =>
         isInputFolderMode() ? "ComfyUI input folder" : "vlo memory";
 
-    const commit = (nextValue) => {
-        widget.value = normalizeBatchSelection(nextValue);
+    const readFlags = (count) =>
+        flagWidget ? normalizeBatchFlags(flagWidget.value, count) : [];
+
+    /**
+     * Selection and flags are committed together: a flag belongs to the item
+     * at its index, so every add, remove, and move has to carry it along or
+     * the loader would deliver someone else's audio.
+     */
+    const commit = (nextValue, nextFlags) => {
+        const normalized = normalizeBatchSelection(nextValue);
+        widget.value = normalized;
+        selected = normalized;
+        if (flagWidget) {
+            flagWidget.value = formatBatchFlags(
+                normalizeBatchFlags(nextFlags ?? readFlags(normalized.length), normalized.length)
+            );
+        }
         markGraphChanged(node);
     };
 
@@ -241,13 +262,30 @@ function createOrderedBatchSelector(node, config, toggleWidget, initialValue) {
                 row.append(unavailable);
             }
 
+            if (flagWidget) {
+                const flags = readFlags(selected.length);
+                const flagToggle = document.createElement("input");
+                flagToggle.type = "checkbox";
+                flagToggle.checked = flags[index] === true;
+                flagToggle.title = config.flagTitle ?? "Per-item option";
+                flagToggle.addEventListener("change", () => {
+                    const nextFlags = readFlags(selected.length);
+                    nextFlags[index] = flagToggle.checked;
+                    commit(selected, nextFlags);
+                });
+                row.append(flagToggle);
+            }
+
             const upButton = document.createElement("button");
             upButton.type = "button";
             upButton.textContent = "↑";
             upButton.title = "Move earlier";
             upButton.disabled = index === 0;
             upButton.addEventListener("click", () => {
-                commit(moveBatchSelection(selected, index, index - 1));
+                commit(
+                    moveBatchSelection(selected, index, index - 1),
+                    moveBatchSelection(readFlags(selected.length), index, index - 1)
+                );
             });
 
             const downButton = document.createElement("button");
@@ -256,7 +294,10 @@ function createOrderedBatchSelector(node, config, toggleWidget, initialValue) {
             downButton.title = "Move later";
             downButton.disabled = index === selected.length - 1;
             downButton.addEventListener("click", () => {
-                commit(moveBatchSelection(selected, index, index + 1));
+                commit(
+                    moveBatchSelection(selected, index, index + 1),
+                    moveBatchSelection(readFlags(selected.length), index, index + 1)
+                );
             });
 
             const removeButton = document.createElement("button");
@@ -264,7 +305,13 @@ function createOrderedBatchSelector(node, config, toggleWidget, initialValue) {
             removeButton.textContent = "×";
             removeButton.title = "Remove";
             removeButton.addEventListener("click", () => {
-                commit(selected.filter((_, itemIndex) => itemIndex !== index));
+                const remainingFlags = readFlags(selected.length).filter(
+                    (_, itemIndex) => itemIndex !== index
+                );
+                commit(
+                    selected.filter((_, itemIndex) => itemIndex !== index),
+                    remainingFlags
+                );
             });
             row.append(upButton, downButton, removeButton);
             list.append(row);
@@ -307,7 +354,7 @@ function createOrderedBatchSelector(node, config, toggleWidget, initialValue) {
 
     addButton.addEventListener("click", () => {
         if (!availableSelect.value) return;
-        commit([...selected, availableSelect.value]);
+        commit([...selected, availableSelect.value], [...readFlags(selected.length), false]);
     });
     refreshButton.addEventListener("click", () => void refreshOptions());
 
@@ -350,8 +397,25 @@ app.registerExtension({
             return;
         }
 
+        // The flag list is written by the per-row checkboxes, so the raw text
+        // widget only gets in the way. It stays on the node — hidden widgets
+        // still serialize — so the value survives save and reload.
+        const flagWidget = config.flagWidget
+            ? findWidget(node, config.flagWidget)
+            : null;
+        if (flagWidget) {
+            flagWidget.hidden = true;
+            flagWidget.computeSize = () => [0, -4];
+        }
+
         replaceWidgetAtIndex(node, inputWidget, (initialValue) =>
-            createOrderedBatchSelector(node, config, toggleWidget, initialValue)
+            createOrderedBatchSelector(
+                node,
+                config,
+                toggleWidget,
+                flagWidget,
+                initialValue
+            )
         );
     },
 });

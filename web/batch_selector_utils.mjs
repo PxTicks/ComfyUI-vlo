@@ -47,3 +47,39 @@ export function getBatchSourceRoute(kind, disableInMemory) {
         ? `/api/vlo-memory/input-files?kind=${encodedKind}`
         : `/api/vlo-memory/options?kind=${encodedKind}`;
 }
+
+const TRUE_FLAG_TOKENS = new Set(["1", "true", "yes", "on"]);
+
+/**
+ * Reads the loader's comma-separated flag widget into exactly `count`
+ * booleans. Anything the user never set reads as false, which is what the
+ * Python side assumes too.
+ */
+export function normalizeBatchFlags(value, count) {
+    const tokens = Array.isArray(value)
+        ? value
+        : typeof value === "string" && value.trim()
+          ? value.split(",")
+          : [];
+    const flags = [];
+    for (let index = 0; index < count; index += 1) {
+        const token = tokens[index];
+        if (typeof token === "boolean") {
+            flags.push(token);
+            continue;
+        }
+        if (typeof token === "number") {
+            flags.push(token !== 0);
+            continue;
+        }
+        flags.push(
+            typeof token === "string" &&
+                TRUE_FLAG_TOKENS.has(token.trim().toLowerCase())
+        );
+    }
+    return flags;
+}
+
+export function formatBatchFlags(flags) {
+    return flags.map((flag) => (flag ? "1" : "0")).join(",");
+}

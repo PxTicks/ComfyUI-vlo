@@ -23,7 +23,8 @@ The corresponding **Batch** nodes load an ordered multi-selection:
 
 - `vlo Memory Load Image Batch` outputs ordered `IMAGE` and `MASK` lists.
 - `vlo Memory Load Audio Batch` outputs an ordered `AUDIO` list.
-- `vlo Memory Load Video Batch` outputs an ordered `VIDEO` list.
+- `vlo Memory Load Video Batch` outputs an ordered `VIDEO` list plus a matching
+  `BOOLEAN` "use audio" list, one flag per video.
 
 These are ComfyUI list outputs rather than concatenated tensors. Images may
 therefore have different dimensions, audio clips may have different durations,
@@ -40,10 +41,15 @@ list order sent downstream.
 Selections are capped at 100 items as a general safety bound. Model-specific
 nodes should enforce their own lower limits when consuming a collection.
 
-The vlo application does not yet inject collection-valued media inputs. That
-requires a separate application-side cardinality and upload contract; these
-nodes currently provide the ComfyUI execution and authoring primitives for that
-work.
+#### Per-video audio flags
+
+The video loader also carries a per-item switch. `include_audio` is a
+comma-separated flag list in selection order (`1,0,1`); the selector renders it
+as a checkbox on each row, and vlo writes it from the speaker toggles on its
+batch slot. Unset items are false, and the flags travel with their video through
+adds, removals, and reordering. The loader emits them as its second output, so a
+consumer that takes a `BOOLEAN` list — such as the MiniMax H3 adapter's
+`use_embedded_video_audio` — receives one flag per delivered video.
 
 ### MiniMax H3 batch adapter
 
@@ -72,8 +78,10 @@ by the tag numbers.
 - a `BOOLEAN` list with one entry per reference video, bound positionally.
 
 Both work because the node uses Comfy list inputs, so a widget arrives as a
-one-item list and a connected list arrives with one entry per video. Per-video
-gating needs no schema change when it is driven from a real per-video source.
+one-item list and a connected list arrives with one entry per video. The shipped
+vlo workflow uses the second form: the video batch loader's "use audio" output
+is linked to this input, so inclusion is decided per video rather than once for
+the whole batch.
 
 An `AUDIO` list connected to `ref_video_audios` overrides soundtracks
 positionally and always wins, whether or not embedded audio is enabled for that

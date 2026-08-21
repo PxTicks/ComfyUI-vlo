@@ -28,7 +28,10 @@ from comfy_api.latest import ComfyExtension, Input, InputImpl, Types, io
 from comfy_execution.graph_utils import GraphBuilder
 from comfy_execution.utils import get_executing_context
 
-from .batch_loader_utils import normalize_memory_batch_values
+from .batch_loader_utils import (
+    normalize_memory_batch_flags,
+    normalize_memory_batch_values,
+)
 from .media_registry import (
     MediaItem,
     MediaRegistry,
@@ -1108,19 +1111,51 @@ class vloMemoryLoadVideoBatch(io.ComfyNode):
                         "directory instead of the vlo in-memory registry."
                     ),
                 ),
+                # Appended last on purpose: workflows saved before this input
+                # existed restore widget values by position, so the two
+                # original widgets have to keep their slots.
+                io.String.Input(
+                    "include_audio",
+                    default="",
+                    tooltip=(
+                        "Per-video audio inclusion, as a comma-separated flag list "
+                        "in selection order (for example '1,0,1'). Unset videos "
+                        "are excluded. Feed the 'use audio' output to a consumer "
+                        "that takes a BOOLEAN list, such as the vlo MiniMax H3 "
+                        "adapter's use_embedded_video_audio."
+                    ),
+                ),
             ],
             outputs=[
                 io.Video.Output(
                     display_name="videos",
                     tooltip="Ordered video list.",
                     is_output_list=True,
-                )
+                ),
+                io.Boolean.Output(
+                    display_name="use audio",
+                    tooltip=(
+                        "Audio-inclusion flags in the same order as the video "
+                        "list, one per video."
+                    ),
+                    is_output_list=True,
+                ),
             ],
         )
 
     @classmethod
-    def execute(cls, files, disable_in_memory=False) -> io.NodeOutput:
+    def execute(
+        cls,
+        files,
+        disable_in_memory=False,
+        include_audio="",
+    ) -> io.NodeOutput:
         values = normalize_memory_batch_values(files, label="video")
+        audio_flags = normalize_memory_batch_flags(
+            include_audio,
+            count=len(values),
+            label="Video audio inclusion",
+        )
         output: list[Input.Video] = []
         for value in values:
             if _should_load_from_filepath(value, disable_in_memory=disable_in_memory):
@@ -1131,26 +1166,40 @@ class vloMemoryLoadVideoBatch(io.ComfyNode):
                 output.append(
                     InputImpl.VideoFromFile(stdlib_io.BytesIO(item.data))
                 )
-        return io.NodeOutput(output)
+        return io.NodeOutput(output, audio_flags)
 
     @classmethod
-    def fingerprint_inputs(cls, files, disable_in_memory=False):
-        return _fingerprint_memory_batch_values(
+    def fingerprint_inputs(cls, files, disable_in_memory=False, include_audio=""):
+        changed, fingerprints = _fingerprint_memory_batch_values(
             files,
             label="video",
             expected_kind="video",
             disable_in_memory=disable_in_memory,
             use_mtime=True,
         )
+        # The flags are part of what this node delivers, so flipping one has to
+        # invalidate the cached execution just like swapping a video does.
+        return changed, (*fingerprints, f"audio:{include_audio}")
 
     @classmethod
-    def validate_inputs(cls, files, disable_in_memory=False):
-        return _validate_memory_batch_values(
+    def validate_inputs(cls, files, disable_in_memory=False, include_audio=""):
+        result = _validate_memory_batch_values(
             files,
             label="video",
             expected_kind="video",
             disable_in_memory=disable_in_memory,
         )
+        if result is not True:
+            return result
+        try:
+            normalize_memory_batch_flags(
+                include_audio,
+                count=len(normalize_memory_batch_values(files, label="video")),
+                label="Video audio inclusion",
+            )
+        except ValueError as exc:
+            return str(exc)
+        return True
 
 
 def _unwrap_list_input(value: Any, *, label: str) -> Any:

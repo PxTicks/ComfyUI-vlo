@@ -32,4 +32,61 @@ def normalize_memory_batch_values(
     return normalized
 
 
-__all__ = ["MAX_MEMORY_BATCH_ITEMS", "normalize_memory_batch_values"]
+_TRUE_FLAG_TOKENS = frozenset({"1", "true", "yes", "on"})
+_FALSE_FLAG_TOKENS = frozenset({"0", "false", "no", "off", ""})
+
+
+def normalize_memory_batch_flags(
+    raw_flags: Any,
+    *,
+    count: int,
+    label: str,
+) -> list[bool]:
+    """Normalize a per-item flag list to exactly one boolean per batch item.
+
+    Accepts the comma-separated string the widget carries ("1,0,1"), or an
+    already-split sequence. Items the caller never set are False, so a partly
+    filled list stays meaningful; more flags than items is a mismatch worth
+    reporting rather than silently trimming.
+    """
+    if raw_flags is None:
+        tokens: list[Any] = []
+    elif isinstance(raw_flags, str):
+        tokens = [token for token in raw_flags.split(",")] if raw_flags.strip() else []
+    elif isinstance(raw_flags, (list, tuple)):
+        tokens = list(raw_flags)
+    elif isinstance(raw_flags, bool):
+        tokens = [raw_flags]
+    else:
+        raise ValueError(f"{label} must be a comma-separated flag list")
+
+    flags: list[bool] = []
+    for index, token in enumerate(tokens):
+        if isinstance(token, bool):
+            flags.append(token)
+            continue
+        if isinstance(token, (int, float)):
+            flags.append(token != 0)
+            continue
+        if not isinstance(token, str):
+            raise ValueError(f"{label} item {index + 1} is not a valid flag")
+        normalized = token.strip().lower()
+        if normalized in _TRUE_FLAG_TOKENS:
+            flags.append(True)
+        elif normalized in _FALSE_FLAG_TOKENS:
+            flags.append(False)
+        else:
+            raise ValueError(f"{label} item {index + 1} is not a valid flag")
+
+    if len(flags) > count:
+        raise ValueError(
+            f"{label} has {len(flags)} flags for {count} items"
+        )
+    return flags + [False] * (count - len(flags))
+
+
+__all__ = [
+    "MAX_MEMORY_BATCH_ITEMS",
+    "normalize_memory_batch_flags",
+    "normalize_memory_batch_values",
+]
