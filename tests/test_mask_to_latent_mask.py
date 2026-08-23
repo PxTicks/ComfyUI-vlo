@@ -270,6 +270,43 @@ def test_output_passes_through_set_latent_noise_mask_untouched(nodes_module) -> 
     assert torch.allclose(prepared[0, 0], out)
 
 
+def test_compositor_normalizes_stock_video_noise_mask(nodes_module) -> None:
+    destination = _video_latent(3, 2, 2, channels=4)
+    destination["noise_mask"] = torch.tensor([0.0, 0.25, 1.0]).view(3, 1, 1, 1).expand(
+        3, 1, 2, 2
+    )
+    source = {"samples": torch.ones_like(destination["samples"])}
+
+    output = nodes_module.vloLatentCompositeMasked.execute(
+        destination=destination,
+        source=source,
+    ).result[0]
+
+    expected = torch.tensor([0.0, 0.25, 1.0]).view(1, 1, 3, 1, 1).expand_as(
+        output["samples"]
+    )
+    assert torch.allclose(output["samples"], expected)
+    assert tuple(output["noise_mask"].shape) == (3, 1, 2, 2)
+
+
+def test_compositor_keeps_preshaped_video_noise_mask_compatible(nodes_module) -> None:
+    destination = _video_latent(3, 2, 2, channels=4)
+    destination["noise_mask"] = torch.tensor([0.0, 0.25, 1.0]).view(1, 1, 3, 1, 1).expand(
+        1, 1, 3, 2, 2
+    )
+    source = {"samples": torch.ones_like(destination["samples"])}
+
+    output = nodes_module.vloLatentCompositeMasked.execute(
+        destination=destination,
+        source=source,
+    ).result[0]
+
+    expected = torch.tensor([0.0, 0.25, 1.0]).view(1, 1, 3, 1, 1).expand_as(
+        output["samples"]
+    )
+    assert torch.allclose(output["samples"], expected)
+
+
 # --- encoder-accurate frame counts (non-canonical lengths) --------------------
 
 

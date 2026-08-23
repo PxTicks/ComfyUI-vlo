@@ -22,6 +22,7 @@ from server import PromptServer
 from typing_extensions import override
 
 import comfy.model_management
+import comfy.utils
 from comfy.cli_args import args
 from comfy.patcher_extension import WrappersMP
 from comfy_api.latest import ComfyExtension, Input, InputImpl, Types, io
@@ -2148,6 +2149,7 @@ class vloLatentCompositeMasked(io.ComfyNode):
             return io.NodeOutput(output)
 
         mask = mask.to(dtype=dest_samples.dtype, device=dest_samples.device)
+        mask = comfy.utils.reshape_mask(mask, dest_samples.shape)
 
         if force_binary_mask:
             mask = (mask >= 0.5).to(dtype=mask.dtype)
