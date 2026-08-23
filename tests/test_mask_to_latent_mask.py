@@ -446,3 +446,71 @@ def test_minimax_padded_tail_repeats_the_last_real_frame(nodes_module) -> None:
         (0, 1), (1, 5), (5, 9), (9, 13), (13, 17),
         (17, 18), (17, 18),
     ]
+
+
+# --- joint AV latents ---------------------------------------------------------
+
+
+def _av_latent(frames: int, height: int, width: int, audio_len: int = 37):
+    import comfy.nested_tensor
+
+    video = torch.zeros(1, 24, frames, height, width)
+    audio = torch.zeros(1, 32, 2, audio_len)
+    return {"samples": comfy.nested_tensor.NestedTensor((video, audio))}
+
+
+def test_joint_av_latent_is_sized_against_its_video_stream(nodes_module) -> None:
+    out = nodes_module.vloMaskToLatentMask.execute(
+        latent=_av_latent(7, 8, 12),
+        vae=_MiniMaxVae(),
+        masks=torch.rand(22, 64, 96),
+    ).result[0]
+
+    assert tuple(out.shape) == (7, 8, 12)
+
+
+def test_av_latent_output_leaves_the_audio_stream_unmasked(nodes_module) -> None:
+    """A plain video mask on a nested latent: the sampler fills audio with ones."""
+    import comfy.utils
+
+    latent = _av_latent(7, 8, 12)
+    video, audio = latent["samples"].unbind()
+
+    out = nodes_module.vloMaskToLatentMask.execute(
+        latent=latent, vae=_MiniMaxVae(), masks=torch.rand(22, 64, 96)
+    ).result[0]
+
+    # What SetLatentNoiseMask stores, then what CFGGuider.inner_sample does with it.
+    noise_mask = out.reshape((-1, 1, out.shape[-2], out.shape[-1]))
+    assert not noise_mask.is_nested
+    denoise_masks = [noise_mask]
+    for shape in [audio.shape][len(denoise_masks) - 1 :]:
+        denoise_masks.append(torch.ones(shape))
+
+    prepared = [
+        comfy.utils.reshape_mask(m, s)
+        for m, s in zip(denoise_masks, [video.shape, audio.shape])
+    ]
+    assert tuple(prepared[0].shape) == tuple(video.shape)
+    assert torch.allclose(prepared[0][0, 0], out)
+    assert tuple(prepared[1].shape) == tuple(audio.shape)
+    assert prepared[1].min() == 1.0  # audio fully denoised, i.e. generated normally
+
+
+def test_av_latent_still_validates_the_video_frame_count(nodes_module) -> None:
+    with pytest.raises(ValueError, match="but the latent has 5"):
+        nodes_module.vloMaskToLatentMask.execute(
+            latent=_av_latent(5, 8, 12),
+            vae=_MiniMaxVae(),
+            masks=torch.ones(22, 64, 96),
+        )
+
+
+def test_audio_only_nested_latent_is_rejected_clearly(nodes_module) -> None:
+    import comfy.nested_tensor
+
+    latent = {"samples": comfy.nested_tensor.NestedTensor((torch.zeros(1, 32, 2, 37),))}
+    with pytest.raises(ValueError, match="no video stream"):
+        nodes_module.vloMaskToLatentMask.execute(
+            latent=latent, vae=_MiniMaxVae(), masks=torch.ones(22, 64, 96)
+        )

@@ -568,6 +568,25 @@ _MASK_POOLING_METHODS = {
 _MASK_SPATIAL_RESIZE_MODES = ("bilinear", "nearest-exact", "area", "bicubic")
 
 
+def _latent_video_stream(samples: Any) -> torch.Tensor:
+    """The stream a video mask applies to, unwrapping joint AV latents.
+
+    Joint latents (EmptyMiniMaxH3LatentAV, LTXVConcatAVLatent) carry a
+    NestedTensor of (video, audio) rather than a plain tensor. A video mask
+    describes the video stream, and the sampler fills any stream the mask does
+    not cover with ones, so the audio stream is simply generated as usual.
+    """
+    if getattr(samples, "is_nested", False):
+        for stream in samples.unbind():
+            if isinstance(stream, torch.Tensor) and stream.ndim == 5:
+                return stream
+        raise ValueError(
+            "This joint latent has no video stream to mask. Masks describe video, "
+            "so use an audio mask node for the audio stream."
+        )
+    return samples
+
+
 def _latent_mask_target_shape(samples: torch.Tensor) -> tuple[int, int, int, bool]:
     """Return the (frames, height, width, is_temporal) a noise mask must match."""
     if samples.ndim == 5:
@@ -2185,14 +2204,17 @@ class vloMaskToLatentMask(io.ComfyNode):
                 "Converts a pixel-space mask sequence into a mask shaped exactly like the "
                 "supplied latent. The latent supplies the destination frames/height/width "
                 "and the VAE supplies the temporal correspondence, so the result can be "
-                "attached with the stock SetLatentNoiseMask node."
+                "attached with the stock SetLatentNoiseMask node. Joint video+audio "
+                "latents are sized against their video stream; the audio stream is left "
+                "unmasked and generates as usual."
             ),
             inputs=[
                 io.Latent.Input(
                     "latent",
                     tooltip=(
                         "Latent the mask must match. Only its dimensions are read; the "
-                        "latent itself is neither modified nor returned."
+                        "latent itself is neither modified nor returned. Joint AV latents "
+                        "are accepted and sized against their video stream."
                     ),
                 ),
                 io.Vae.Input(
@@ -2247,7 +2269,7 @@ class vloMaskToLatentMask(io.ComfyNode):
         pooling_method="max",
         resize_mode="bilinear",
     ) -> io.NodeOutput:
-        samples = latent.get("samples")
+        samples = _latent_video_stream(latent.get("samples"))
         if not isinstance(samples, torch.Tensor):
             raise ValueError("latent['samples'] must be a tensor.")
 
