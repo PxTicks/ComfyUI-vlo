@@ -2678,6 +2678,63 @@ class vloSetAudioLatentBinaryMasks(io.ComfyNode):
         return io.NodeOutput(output)
 
 
+def _latent_streams(samples: Any) -> tuple[list[torch.Tensor], bool]:
+    """Every stream of a latent, plus whether it arrived as a joint AV latent."""
+    if getattr(samples, "is_nested", False):
+        return list(samples.unbind()), True
+    return [samples], False
+
+
+def _clone_latent_samples(samples: Any) -> Any:
+    """A detached copy of a latent, nested or not (NestedTensor has no clone)."""
+    streams, nested = _latent_streams(samples)
+    cloned = [stream.clone() for stream in streams]
+    return comfy.nested_tensor.NestedTensor(cloned) if nested else cloned[0]
+
+
+def _stream_noise_masks(noise_mask: Any, stream_count: int) -> list[Any]:
+    """One mask per stream, following the sampler's own nested-mask rules.
+
+    comfy.samplers unbinds a nested mask, drops any entry past the last stream
+    and fills the streams the mask does not reach with ones, so those streams
+    are denoised in full. A plain mask therefore describes the first stream
+    only. Compositing under the same rules reproduces what the sampler did.
+    """
+    if getattr(noise_mask, "is_nested", False):
+        masks = list(noise_mask.unbind())[:stream_count]
+    else:
+        masks = [noise_mask]
+    masks += [None] * (stream_count - len(masks))
+    return [mask if isinstance(mask, torch.Tensor) else None for mask in masks]
+
+
+def _composite_stream(
+    dest_samples: torch.Tensor,
+    src_samples: torch.Tensor,
+    mask: Any,
+    *,
+    force_binary_mask: bool,
+) -> torch.Tensor:
+    if mask is None:
+        # Unmasked streams are denoised in full, so the source owns them whole.
+        return src_samples.clone()
+
+    mask = mask.to(dtype=dest_samples.dtype, device=dest_samples.device)
+    mask = comfy.utils.reshape_mask(mask, dest_samples.shape)
+
+    if force_binary_mask:
+        mask = (mask >= 0.5).to(dtype=mask.dtype)
+
+    try:
+        return src_samples * mask + dest_samples * (1.0 - mask)
+    except RuntimeError as e:
+        raise ValueError(
+            f"Could not composite: destination {tuple(dest_samples.shape)}, "
+            f"source {tuple(src_samples.shape)}, mask {tuple(mask.shape)} "
+            f"are not broadcast-compatible. Ensure the mask is preshaped for this latent."
+        ) from e
+
+
 class vloLatentCompositeMasked(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -2689,7 +2746,11 @@ class vloLatentCompositeMasked(io.ComfyNode):
             description=(
                 "Composites a source latent into a destination latent using "
                 "the destination's existing noise_mask. The mask dictates where the "
-                "source replaces the destination."
+                "source replaces the destination. Joint video+audio latents are "
+                "composited stream by stream, exactly as the sampler masked them: a "
+                "nested mask supplies one mask per stream, a plain mask covers the "
+                "first stream only, and any stream the mask does not reach is taken "
+                "whole from the source because the sampler denoised it in full."
             ),
             inputs=[
                 io.Latent.Input(
@@ -2716,30 +2777,40 @@ class vloLatentCompositeMasked(io.ComfyNode):
 
     @classmethod
     def execute(cls, destination, source, clear_mask=False, force_binary_mask=False) -> io.NodeOutput:
-        dest_samples = destination["samples"]
-        src_samples = source["samples"]
-
         output = destination.copy()
-        output["samples"] = dest_samples.clone()
 
         mask = destination.get("noise_mask")
         if mask is None:
+            output["samples"] = _clone_latent_samples(destination["samples"])
             return io.NodeOutput(output)
 
-        mask = mask.to(dtype=dest_samples.dtype, device=dest_samples.device)
-        mask = comfy.utils.reshape_mask(mask, dest_samples.shape)
-
-        if force_binary_mask:
-            mask = (mask >= 0.5).to(dtype=mask.dtype)
-
-        try:
-            output["samples"] = src_samples * mask + dest_samples * (1.0 - mask)
-        except RuntimeError as e:
+        dest_streams, dest_nested = _latent_streams(destination["samples"])
+        src_streams, _ = _latent_streams(source["samples"])
+        if len(src_streams) != len(dest_streams):
             raise ValueError(
-                f"Could not composite: destination {tuple(dest_samples.shape)}, "
-                f"source {tuple(src_samples.shape)}, mask {tuple(mask.shape)} "
-                f"are not broadcast-compatible. Ensure the mask is preshaped for this latent."
-            ) from e
+                f"Could not composite: the destination has {len(dest_streams)} "
+                f"latent stream(s) and the source has {len(src_streams)}. Joint "
+                "video+audio latents must be composited against a source with the "
+                "same streams."
+            )
+
+        masks = _stream_noise_masks(mask, len(dest_streams))
+        composited = [
+            _composite_stream(
+                dest_stream,
+                src_stream,
+                stream_mask,
+                force_binary_mask=force_binary_mask,
+            )
+            for dest_stream, src_stream, stream_mask in zip(
+                dest_streams, src_streams, masks
+            )
+        ]
+        output["samples"] = (
+            comfy.nested_tensor.NestedTensor(composited)
+            if dest_nested
+            else composited[0]
+        )
 
         if clear_mask:
             output.pop("noise_mask", None)

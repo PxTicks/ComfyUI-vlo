@@ -514,3 +514,148 @@ def test_audio_only_nested_latent_is_rejected_clearly(nodes_module) -> None:
         nodes_module.vloMaskToLatentMask.execute(
             latent=latent, vae=_MiniMaxVae(), masks=torch.ones(22, 64, 96)
         )
+
+
+# --- compositing joint AV latents ---------------------------------------------
+
+
+def _av_composite_pair(frames: int = 3, audio_len: int = 8):
+    """A destination of zeros and a source of ones, as nested (video, audio)."""
+    import comfy.nested_tensor
+
+    destination = _av_latent(frames, 2, 2, audio_len=audio_len)
+    video, audio = destination["samples"].unbind()
+    source = {
+        "samples": comfy.nested_tensor.NestedTensor(
+            (torch.ones_like(video), torch.ones_like(audio))
+        )
+    }
+    return destination, source, video, audio
+
+
+def _audio_timeline_mask(audio: torch.Tensor, values: list[float]) -> torch.Tensor:
+    """An audio noise mask shaped like its stream, varying only along time."""
+    timeline = torch.tensor(values).view(1, 1, 1, -1)
+    return timeline.expand_as(audio).clone()
+
+
+def test_compositor_masks_both_streams_of_a_joint_av_latent(nodes_module) -> None:
+    import comfy.nested_tensor
+
+    destination, source, video, audio = _av_composite_pair(audio_len=4)
+    video_mask = torch.tensor([0.0, 1.0, 0.0]).view(3, 1, 1, 1).expand(3, 1, 2, 2)
+    audio_mask = _audio_timeline_mask(audio, [1.0, 1.0, 0.0, 0.0])
+    destination["noise_mask"] = comfy.nested_tensor.NestedTensor(
+        (video_mask, audio_mask)
+    )
+
+    output = nodes_module.vloLatentCompositeMasked.execute(
+        destination=destination, source=source
+    ).result[0]
+
+    assert getattr(output["samples"], "is_nested", False)
+    out_video, out_audio = output["samples"].unbind()
+    assert torch.allclose(
+        out_video,
+        torch.tensor([0.0, 1.0, 0.0]).view(1, 1, 3, 1, 1).expand_as(out_video),
+    )
+    assert torch.allclose(
+        out_audio,
+        torch.tensor([1.0, 1.0, 0.0, 0.0]).view(1, 1, 1, 4).expand_as(out_audio),
+    )
+
+
+def test_compositor_gives_an_unmasked_stream_wholly_to_the_source(nodes_module) -> None:
+    """A plain video mask covers stream 0; the sampler denoised audio in full."""
+    destination, source, _, _ = _av_composite_pair()
+    destination["noise_mask"] = (
+        torch.tensor([0.0, 0.5, 1.0]).view(3, 1, 1, 1).expand(3, 1, 2, 2)
+    )
+
+    output = nodes_module.vloLatentCompositeMasked.execute(
+        destination=destination, source=source
+    ).result[0]
+
+    out_video, out_audio = output["samples"].unbind()
+    assert torch.allclose(
+        out_video,
+        torch.tensor([0.0, 0.5, 1.0]).view(1, 1, 3, 1, 1).expand_as(out_video),
+    )
+    assert torch.allclose(out_audio, torch.ones_like(out_audio))
+
+
+def test_compositor_drops_mask_entries_past_the_last_stream(nodes_module) -> None:
+    """The sampler truncates a nested mask to the stream count, so this does too."""
+    import comfy.nested_tensor
+
+    destination, source, _, audio = _av_composite_pair(audio_len=4)
+    destination["noise_mask"] = comfy.nested_tensor.NestedTensor(
+        (
+            torch.zeros(3, 1, 2, 2),
+            _audio_timeline_mask(audio, [0.0, 0.0, 0.0, 0.0]),
+            torch.ones(3, 1, 2, 2),
+        )
+    )
+
+    output = nodes_module.vloLatentCompositeMasked.execute(
+        destination=destination, source=source
+    ).result[0]
+
+    out_video, out_audio = output["samples"].unbind()
+    assert torch.allclose(out_video, torch.zeros_like(out_video))
+    assert torch.allclose(out_audio, torch.zeros_like(out_audio))
+
+
+def test_compositor_binarizes_and_clears_a_nested_mask(nodes_module) -> None:
+    import comfy.nested_tensor
+
+    destination, source, _, audio = _av_composite_pair(audio_len=4)
+    destination["noise_mask"] = comfy.nested_tensor.NestedTensor(
+        (
+            torch.tensor([0.4, 0.6, 0.5]).view(3, 1, 1, 1).expand(3, 1, 2, 2),
+            _audio_timeline_mask(audio, [0.49, 0.51, 0.0, 1.0]),
+        )
+    )
+
+    output = nodes_module.vloLatentCompositeMasked.execute(
+        destination=destination,
+        source=source,
+        clear_mask=True,
+        force_binary_mask=True,
+    ).result[0]
+
+    out_video, out_audio = output["samples"].unbind()
+    assert torch.allclose(
+        out_video,
+        torch.tensor([0.0, 1.0, 1.0]).view(1, 1, 3, 1, 1).expand_as(out_video),
+    )
+    assert torch.allclose(
+        out_audio,
+        torch.tensor([0.0, 1.0, 0.0, 1.0]).view(1, 1, 1, 4).expand_as(out_audio),
+    )
+    assert "noise_mask" not in output
+
+
+def test_compositor_returns_an_unmasked_joint_latent_untouched(nodes_module) -> None:
+    destination, source, video, _ = _av_composite_pair()
+    destination["samples"].unbind()[0].fill_(0.25)
+
+    output = nodes_module.vloLatentCompositeMasked.execute(
+        destination=destination, source=source
+    ).result[0]
+
+    out_video, out_audio = output["samples"].unbind()
+    assert torch.allclose(out_video, torch.full_like(out_video, 0.25))
+    assert torch.allclose(out_audio, torch.zeros_like(out_audio))
+    assert out_video is not video  # a copy, not the caller's tensor
+
+
+def test_compositor_rejects_a_source_with_different_streams(nodes_module) -> None:
+    destination, _, video, _ = _av_composite_pair()
+    destination["noise_mask"] = torch.ones(3, 1, 2, 2)
+    source = {"samples": torch.ones_like(video)}
+
+    with pytest.raises(ValueError, match="2 latent stream"):
+        nodes_module.vloLatentCompositeMasked.execute(
+            destination=destination, source=source
+        )
