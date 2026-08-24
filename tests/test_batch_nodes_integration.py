@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import io
 import os
 import sys
@@ -58,21 +58,14 @@ def _load_nodes_module():
         server.PromptServer = PromptServer
         sys.modules["server"] = server
 
+        # Stand the plugin directory up as a package so the nodes package's
+        # `..media_registry` / `..batch_loader_utils` imports resolve.
         package_name = "comfyui_vlo_batch_test"
         package = types.ModuleType(package_name)
         package.__path__ = [str(PLUGIN_ROOT)]
         sys.modules[package_name] = package
 
-        spec = importlib.util.spec_from_file_location(
-            f"{package_name}.nodes",
-            PLUGIN_ROOT / "nodes.py",
-        )
-        if spec is None or spec.loader is None:
-            raise RuntimeError("Could not load ComfyUI-vlo nodes module")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
-        return module
+        return importlib.import_module(f"{package_name}.nodes")
     finally:
         sys.argv = original_argv
         if original_server is None:
@@ -148,7 +141,7 @@ def test_video_batch_emits_audio_flags_aligned_with_its_videos(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        nodes_module.InputImpl,
+        nodes_module.loaders.InputImpl,
         "VideoFromFile",
         lambda source: ("video", source),
     )
@@ -344,7 +337,7 @@ def test_minimax_batch_adapter_expands_ordered_native_inputs(
 
     native_node = _fake_native_minimax_node(nodes_module)
     monkeypatch.setattr(
-        nodes_module,
+        nodes_module.minimax,
         "_get_native_minimax_h3_reference_node",
         lambda: native_node,
     )
@@ -409,7 +402,7 @@ def test_minimax_batch_adapter_uses_embedded_audio_and_schema_limits(
             )
 
     monkeypatch.setattr(
-        nodes_module,
+        nodes_module.minimax,
         "_get_native_minimax_h3_reference_node",
         lambda: _fake_native_minimax_node(nodes_module, image_max=2),
     )
@@ -448,7 +441,7 @@ def test_minimax_batch_adapter_uses_embedded_audio_and_schema_limits(
         )
 
     monkeypatch.setattr(
-        nodes_module,
+        nodes_module.minimax,
         "_get_native_minimax_h3_reference_node",
         lambda: _fake_native_minimax_node(
             nodes_module,
@@ -484,7 +477,7 @@ def test_minimax_batch_adapter_gates_embedded_audio_per_video(
         return FakeVideo()
 
     monkeypatch.setattr(
-        nodes_module,
+        nodes_module.minimax,
         "_get_native_minimax_h3_reference_node",
         lambda: _fake_native_minimax_node(nodes_module),
     )
@@ -561,7 +554,7 @@ def test_minimax_batch_adapter_rejects_native_schema_drift(
 
     native_node.GET_SCHEMA = incompatible_schema
     monkeypatch.setattr(
-        nodes_module,
+        nodes_module.minimax,
         "_get_native_minimax_h3_reference_node",
         lambda: native_node,
     )
