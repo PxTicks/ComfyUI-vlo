@@ -37,6 +37,12 @@ from .minimax import (
     _get_native_minimax_h3_reference_contract,
     vloMiniMaxH3ReferenceToVideoBatch,
 )
+from .minimax_masked_guide import (
+    vloMiniMaxH3AddMaskedGuide,
+    vloMiniMaxH3GuideTokenMaskPreview,
+    vloMiniMaxH3MaskedGuidePixelFill,
+    vloMiniMaxH3PatchMaskedGuides,
+)
 from .registry import REGISTRY
 from .ttm import vloTimeToMove
 from .video_nodes import (
@@ -57,6 +63,10 @@ class vloExtension(ComfyExtension):
             vloMemoryLoadAudioBatch,
             vloMemoryLoadVideoBatch,
             vloMiniMaxH3ReferenceToVideoBatch,
+            vloMiniMaxH3AddMaskedGuide,
+            vloMiniMaxH3PatchMaskedGuides,
+            vloMiniMaxH3GuideTokenMaskPreview,
+            vloMiniMaxH3MaskedGuidePixelFill,
             vloVideoConvertFps,
             vloSaveImageWebsocketBMP,
             vloSaveVideoWebsocket,

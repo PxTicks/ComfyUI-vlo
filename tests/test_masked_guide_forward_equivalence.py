@@ -1,0 +1,250 @@
+"""The forked H3 forward pass must be stock-identical until the mask says otherwise.
+
+This is the milestone the whole feature rests on: if the fork drifts from core
+for reasons unrelated to masking, every later observation about masked guides is
+uninterpretable. Re-run this after every ComfyUI update.
+"""
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+from minimax_h3_harness import guide_payload, masked_guide_module, tiny_h3_model, tiny_inputs
+
+
+def _run(model, forward, payload, inputs):
+    with torch.no_grad():
+        return forward(model, inputs["x"], inputs["timestep"], inputs["context"], {},
+                       minimax_payload=payload)
+
+
+def _core(model, payload, inputs):
+    with torch.no_grad():
+        return model._forward(inputs["x"], inputs["timestep"], inputs["context"], {},
+                              minimax_payload=payload)
+
+
+@pytest.fixture(scope="module")
+def fork():
+    return masked_guide_module("masked_h3_forward")
+
+
+@pytest.fixture(scope="module")
+def model():
+    return tiny_h3_model()
+
+
+def _tokens(payload):
+    latent = payload["keyframes"][0]["latent"]
+    return latent.shape[2] * (latent.shape[3] // 2) * (latent.shape[4] // 2)
+
+
+def test_fork_matches_core_without_masks(model, fork):
+    """Step 6: the copied _forward reproduces core exactly on an unmasked guide."""
+    inputs = tiny_inputs()
+    expected = _core(model, guide_payload(), inputs)
+    actual = _run(model, fork.masked_forward, guide_payload(), inputs)
+    for got, want in zip(actual, expected):
+        assert torch.equal(got, want)
+
+
+def test_fully_open_mask_matches_stock_add_guide(model, fork):
+    """Step 8, the hard acceptance requirement: mask == 1 everywhere is stock behaviour."""
+    inputs = tiny_inputs()
+    expected = _core(model, guide_payload(), inputs)
+    strengths = torch.ones(_tokens(guide_payload()), dtype=torch.float64)
+    actual = _run(model, fork.masked_forward, guide_payload(strengths), inputs)
+    for got, want in zip(actual, expected):
+        assert torch.equal(got, want)
+
+
+def test_fully_open_mask_keeps_the_scalar_modulation_path(model, fork):
+    """A uniform guide must not split the modulation table into per-token rows."""
+    payload = guide_payload(torch.ones(_tokens(guide_payload()), dtype=torch.float64))
+    plan = fork.build_cond_row_plan(payload, t_v=0.5, vis_aug=0.999)
+    rows_t = plan.segment_rows_t[0]
+    assert rows_t is not None and rows_t.unique().numel() == 1
+    assert float(rows_t[0]) == max(0.5, 0.999)
+
+
+def test_zero_mask_changes_the_output(model, fork):
+    inputs = tiny_inputs()
+    expected = _core(model, guide_payload(), inputs)
+    strengths = torch.zeros(_tokens(guide_payload()), dtype=torch.float64)
+    actual = _run(model, fork.masked_forward, guide_payload(strengths), inputs)
+    assert not torch.equal(actual[0], expected[0])
+
+
+def test_intermediate_masks_are_distinct_and_bracketed(model, fork):
+    """Mask strength has to move the output continuously, not flip between two states."""
+    inputs = tiny_inputs()
+    n = _tokens(guide_payload())
+    outs = {}
+    for s in (0.0, 0.25, 0.5, 0.75, 1.0):
+        payload = guide_payload(torch.full((n,), s, dtype=torch.float64))
+        outs[s] = _run(model, fork.masked_forward, payload, inputs)[0]
+    for a, b in zip((0.0, 0.25, 0.5, 0.75), (0.25, 0.5, 0.75, 1.0)):
+        assert not torch.equal(outs[a], outs[b])
+    # distance from the full-strength result should grow as the guide is trusted less
+    distances = [float((outs[s] - outs[1.0]).abs().mean()) for s in (0.75, 0.5, 0.25, 0.0)]
+    assert distances == sorted(distances)
+
+
+def test_partial_mask_only_perturbs_through_the_guide(model, fork):
+    """A half-open mask must land strictly between the fully open and fully closed cases."""
+    inputs = tiny_inputs()
+    n = _tokens(guide_payload())
+    spatial = torch.zeros(n, dtype=torch.float64)
+    spatial[: n // 2] = 1.0
+    out = _run(model, fork.masked_forward, guide_payload(spatial), inputs)[0]
+    open_out = _run(model, fork.masked_forward, guide_payload(torch.ones(n, dtype=torch.float64)), inputs)[0]
+    closed_out = _run(model, fork.masked_forward, guide_payload(torch.zeros(n, dtype=torch.float64)), inputs)[0]
+    assert not torch.equal(out, open_out) and not torch.equal(out, closed_out)
+
+
+def test_sync_timesteps_off_differs_from_on(model, fork):
+    """The central experiment's A/B: latent corruption alone vs corruption + timestep."""
+    inputs = tiny_inputs()
+    n = _tokens(guide_payload())
+    strengths = torch.full((n,), 0.4, dtype=torch.float64)
+    with torch.no_grad():
+        synced = fork.masked_forward(model, inputs["x"], inputs["timestep"], inputs["context"], {},
+                                     minimax_payload=guide_payload(strengths), sync_timesteps=True)
+        noise_only = fork.masked_forward(model, inputs["x"], inputs["timestep"], inputs["context"], {},
+                                         minimax_payload=guide_payload(strengths), sync_timesteps=False)
+    assert not torch.equal(synced[0], noise_only[0])
+
+
+def test_noise_only_mode_keeps_the_stock_condition_timestep(model, fork):
+    payload = guide_payload(torch.full((_tokens(guide_payload()),), 0.4, dtype=torch.float64))
+    plan = fork.build_cond_row_plan(payload, t_v=0.5, vis_aug=0.999, sync_timesteps=False)
+    assert plan.segment_rows_t == [None]
+    assert plan.aug_rows is not None and float(plan.aug_rows.max()) < 0.999
+
+
+def _chain(model, wrappers, payload, inputs, original=None):
+    """Run a real DIFFUSION_MODEL wrapper chain, the way MiniMaxH3Model.forward does."""
+    import comfy.patcher_extension as ext
+
+    return ext.WrapperExecutor.new_class_executor(
+        original if original is not None else model._forward, model, list(wrappers)
+    ).execute(inputs["x"], inputs["timestep"], inputs["context"], {}, minimax_payload=payload)
+
+
+def test_wrapper_bypasses_samples_without_masked_guides(model, fork):
+    """Compatibility floor: an unmasked sample must reach the stock forward untouched."""
+    inputs = tiny_inputs()
+    wrapper = fork.make_diffusion_model_wrapper()
+    with torch.no_grad():
+        through = _chain(model, [wrapper], guide_payload(), inputs)
+        stock = _core(model, guide_payload(), inputs)
+    for got, want in zip(through, stock):
+        assert torch.equal(got, want)
+
+
+def test_wrapper_diverts_masked_samples(model, fork):
+    inputs = tiny_inputs()
+    strengths = torch.zeros(_tokens(guide_payload()), dtype=torch.float64)
+    with torch.no_grad():
+        through = _chain(model, [fork.make_diffusion_model_wrapper()], guide_payload(strengths), inputs)
+        stock = _core(model, guide_payload(strengths), inputs)
+    assert not torch.equal(through[0], stock[0])
+
+
+def test_later_wrappers_still_run_on_a_masked_sample(model, fork):
+    """The masked branch must stay in the chain: a wrapper added after this node
+    (EasyCache and friends) would otherwise be silently skipped, making the result
+    depend on which order the model patch nodes were chained in."""
+    seen = []
+
+    def later(executor, *args, **kwargs):
+        seen.append(kwargs.get("minimax_payload"))
+        out = executor(*args, **kwargs)
+        return [out[0] * 0.0, out[1]]          # an unmistakable fingerprint
+
+    inputs = tiny_inputs()
+    strengths = torch.zeros(_tokens(guide_payload()), dtype=torch.float64)
+    wrappers = [fork.make_diffusion_model_wrapper(), later]
+    with torch.no_grad():
+        out = _chain(model, wrappers, guide_payload(strengths), inputs)
+    assert len(seen) == 1                      # the later wrapper actually ran
+    assert torch.count_nonzero(out[0]) == 0    # and its effect survived
+
+
+def test_earlier_wrappers_still_wrap_a_masked_sample(model, fork):
+    """Order independence, from the other side."""
+    seen = []
+
+    def earlier(executor, *args, **kwargs):
+        seen.append(True)
+        return executor(*args, **kwargs)
+
+    inputs = tiny_inputs()
+    strengths = torch.zeros(_tokens(guide_payload()), dtype=torch.float64)
+    with torch.no_grad():
+        first = _chain(model, [earlier, fork.make_diffusion_model_wrapper()],
+                       guide_payload(strengths), inputs)
+        second = _chain(model, [fork.make_diffusion_model_wrapper(), earlier],
+                        guide_payload(strengths), inputs)
+    assert len(seen) == 2
+    for got, want in zip(first, second):
+        assert torch.equal(got, want)
+
+
+def test_wrapper_bypasses_non_h3_models(fork):
+    import comfy.patcher_extension as ext
+
+    strengths = torch.zeros(_tokens(guide_payload()), dtype=torch.float64)
+    executor = ext.WrapperExecutor.new_class_executor(
+        lambda *a, **k: "stock", torch.nn.Linear(2, 2), [fork.make_diffusion_model_wrapper()])
+    assert executor.execute(None, None, None, {}, minimax_payload=guide_payload(strengths)) == "stock"
+
+
+def test_masked_guide_coexists_with_refs_and_a_denoise_mask(model, fork, caplog):
+    """The combined path: masked guide + untouched reference + per-token video mask."""
+    inputs = tiny_inputs()
+    n = _tokens(guide_payload())
+    strengths = torch.zeros(n, dtype=torch.float64)
+    strengths[: n // 2] = 1.0
+
+    ref_latent = torch.zeros(1, 24, 1, 2, 2)
+    ref = {"kind": "image", "latent": ref_latent, "latent_h": 2, "latent_w": 2}
+
+    def payload():
+        p = guide_payload(strengths)
+        p["refs"] = [ref]
+        p["cond_video_latents"] = p["cond_video_latents"] + [ref_latent]
+        return p
+
+    denoise_mask = torch.ones(1, 1, 2, 4, 6)
+    denoise_mask[..., :1, :] = 0.25          # part of the target still holds content
+    with caplog.at_level("INFO"), torch.no_grad():
+        out = fork.masked_forward(model, inputs["x"], inputs["timestep"], inputs["context"], {},
+                                  minimax_payload=payload(), denoise_mask=denoise_mask, debug=True)
+        unmasked = model._forward(inputs["x"], inputs["timestep"], inputs["context"], {},
+                                  minimax_payload=payload(), denoise_mask=denoise_mask)
+    assert out[0].shape == unmasked[0].shape
+    assert not torch.equal(out[0], unmasked[0])
+    assert "Masked H3 Guide 0" in caplog.text
+    assert "cond rows expected: {}".format(n) in caplog.text
+
+
+def test_debug_report_is_emitted_once_per_sampling_run(model, fork, caplog):
+    """A per-step report would drown the log over a 30 step sample."""
+    inputs = tiny_inputs()
+    payload = guide_payload(torch.zeros(_tokens(guide_payload()), dtype=torch.float64))
+    with caplog.at_level("INFO"), torch.no_grad():
+        for _ in range(3):
+            fork.masked_forward(model, inputs["x"], inputs["timestep"], inputs["context"], {},
+                                minimax_payload=payload, debug=True)
+    assert caplog.text.count("Masked H3 Guide 0") == 1
+
+
+def test_debug_stays_silent_when_it_is_off(model, fork, caplog):
+    inputs = tiny_inputs()
+    payload = guide_payload(torch.zeros(_tokens(guide_payload()), dtype=torch.float64))
+    with caplog.at_level("INFO"), torch.no_grad():
+        fork.masked_forward(model, inputs["x"], inputs["timestep"], inputs["context"], {},
+                            minimax_payload=payload)
+    assert "Masked H3 Guide" not in caplog.text

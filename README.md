@@ -92,6 +92,24 @@ The wrapper expands to a real native node in the execution graph rather than
 calling its Python method directly. ComfyUI therefore applies the native node's
 normal V3 lifecycle, validation, caching, and resource handling.
 
+### MiniMax H3 masked guides (experimental)
+
+`MiniMax H3 Add Masked Guide` gives an H3 image guide a continuous spatial
+confidence mask: 1 keeps the guide at full strength, 0 corrupts that part of it
+to noise. It works by giving each guide *token* its own condition noise level
+and a matching condition timestep, generalizing the per-token modulation ComfyUI
+already uses for masked target rows.
+
+The mask does nothing until the model passes through `MiniMax H3 Patch Masked
+Guides`, which installs a forked H3 forward pass. Samples without a masked guide
+take the stock path untouched, and a fully open mask is bit-identical to a stock
+`MiniMaxH3AddGuide`.
+
+This is research code: it carries a copy of ComfyUI's `MiniMaxH3Model._forward`
+and is tied to the ComfyUI version it was forked from. See
+[nodes/minimax_masked_guide/README.md](nodes/minimax_masked_guide/README.md) for
+the semantics, the compatibility rules and the experiment protocol.
+
 ## Installation
 
 Clone (or symlink) this repository into your ComfyUI `custom_nodes` directory and
