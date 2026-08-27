@@ -235,3 +235,17 @@ def test_patch_node_maps_the_legacy_sync_timesteps_boolean(node_module, legacy, 
     installed = patched.wrappers[comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL][node_module.WRAPPER_KEY]
     assert len(installed) == 1
     assert node_module.DEFAULT_GUIDE_CLOCK == "matched"   # the documented arm is the default
+
+
+@pytest.mark.parametrize("audio,match", [
+    (torch.zeros(1, 32, 5), "audio stream"),          # rank
+    (torch.zeros(1, 16, 2, 5), "audio stream"),       # channels
+    (torch.zeros(1, 32, 3, 5), "audio stream"),       # not stereo
+    (torch.zeros(2, 32, 2, 5), "batch size"),         # disagrees with the video stream
+])
+def test_the_whole_av_latent_contract_is_checked_not_just_the_video_stream(node_module, audio, match):
+    import comfy.nested_tensor
+
+    latent = {"samples": comfy.nested_tensor.NestedTensor((torch.zeros(1, 24, 2, 4, 8), audio))}
+    with pytest.raises(ValueError, match=match):
+        _add(node_module, torch.ones(1, 64, 128), latent=latent)

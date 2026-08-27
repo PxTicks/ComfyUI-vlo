@@ -98,8 +98,12 @@ modulation table that is rebuilt per block.
 
 ## What `mask = 0` does *not* mean
 
-It does not mean "no token". The token is still there and still attends; it just
-contains approximately noise, and its modulation says so. Measuring whether
+It does not mean "no token", and it does not quite mean "no guidance" either.
+It means: *replace this token's guide latent with deterministic pure noise and
+present it as a visual condition token at the corresponding timestep*. The token
+is still there, still attends, and still occupies the guide's position — it is
+maximally unreliable rather than absent. An all-zero mask on a still guide is
+therefore **not** equivalent to omitting the guide. Measuring whether
 zero-strength tokens have observable residual effects is one of the experiments,
 not an assumption of the design. If they do leak, the follow-up is a hybrid mode
 that omits `s = 0` tokens entirely while keeping continuous weighting for
@@ -123,10 +127,22 @@ wholesale if the feature ever lands upstream.
 **The fork is version-sensitive, and enforces it.** `compatibility.py` hashes the
 source of every core function the fork copies or depends on (`_forward`,
 `_cond_video_rows`, `PackedLayout.__init__`, `patchify_video`, the three `_mod_*`
-helpers) and refuses to run if it does not match the pinned fingerprint. Symbol
-probes alone cannot catch an upstream edit *inside* `_forward` — the fork would
-keep running its stale copy and quietly diverge — so the source itself is the
-version check.
+helpers, and `FinalLayer.forward`) and refuses to run if it does not match the
+pinned fingerprint. Symbol probes alone cannot catch an upstream edit *inside*
+`_forward` — the fork would keep running its stale copy and quietly diverge — so
+the source itself is the version check.
+
+`FinalLayer.forward` is in that list because the fork hands it a per-token row
+*tensor* whenever a denoise mask splits the target rows, which is behaviour PR
+#15375 added. Probing `_mod_row` does not cover it: `FinalLayer` could stop
+forwarding the selector while `_mod_row` still accepts one.
+
+The behavioural probes match that standard. `_probe_wrapper_indexing` builds a
+real three-wrapper chain and asserts that rebuilding from `wrappers[idx + 1:]`
+runs exactly the wrappers registered after ours, in order — because the fork
+depends on what those attributes *mean*, not merely that they exist. If `idx`
+ever stopped being this wrapper's own position, the rebuilt chain would silently
+drop or repeat wrappers rather than fail.
 
 When ComfyUI moves:
 
@@ -142,13 +158,29 @@ have read the diff and want to try anyway.
 ## The invariant that matters
 
 A fully open mask (`M = 1` everywhere, `strength = 1`, `mask_gamma = 1`) must be
-**bit-identical** to a stock `MiniMaxH3AddGuide`. Two details make that hold, and
-both are load-bearing:
+**bit-identical** to a stock `MiniMaxH3AddGuide`, under every clock and at every
+point on the schedule. Three details make that hold, and all are load-bearing:
 
 - the strength → coefficient map pins its endpoints instead of interpolating to
   them, so `s = 1` lands exactly on `visual_cond_noise_aug`;
 - the whole strength → timestep chain stays in float64, because float32 turns
-  `0.999` into `0.9990000128746033` and silently splits the modulation table.
+  `0.999` into `0.9990000128746033` and silently splits the modulation table;
+- the *timestep* endpoint is pinned too. A row sitting exactly at
+  `visual_cond_noise_aug` is labelled `max(t_v, visual_cond_noise_aug)` — core's
+  own condition timestep — rather than by the clock's rule. Without that, `matched`
+  and `target_relative` label it `0.999` while core labels it `t_v`, and a
+  fully-open mask stops being stock-identical for the last step or two, where
+  `t_v` overtakes `0.999`.
+
+That third pin is a real, deliberate exception to `matched`'s "label each token as
+noisy as it actually is". The trade is not avoidable: once `t_v > 0.999` you
+cannot both label a token at its actual corruption level and reproduce core's
+label. The invariant wins, because every later observation about masked guides
+depends on it; the cost is bounded, confined to the open end of the mask, and
+smaller than `5e-4`. Every token the mask actually closes down keeps its honest
+label. `target_relative` reaches the same place from the other side: its floor
+caps at `visual_cond_noise_aug`, so in that tail the whole guide collapses to one
+coefficient and takes core's scalar label with it.
 
 A condition segment whose rows all share one timestep then collapses back onto
 core's scalar path. `test_masked_guide_forward_equivalence.py` asserts this with
@@ -187,7 +219,12 @@ plain one:
 1. **Drop the frames that guide nothing.** A frame whose mask is empty contributes
    a grid of tokens that are all corrupted to noise — pure cost, no guidance. The
    `min_coverage` threshold decides what counts as empty (`0.0`, the default,
-   catches exactly the all-zero masks).
+   catches exactly the all-zero masks). Coverage is measured **after** the crop
+   that fits the guide to the target's framing, not before: judged on the raw
+   mask, a subject lying entirely in a band the cover-crop discards would pass the
+   threshold and then pool to an all-zero grid — which, per the section above, is
+   not an absent guide but a whole segment of pure-noise condition tokens. The
+   node crops once, up front, and both decisions read that same result.
 2. **One guide per surviving run.** Contiguous kept frames become one clip.
 3. **Round the run down** to the nearest length on the ladder. Rounding has to
    throw frames away, and `chunk_align` says which end they come off.

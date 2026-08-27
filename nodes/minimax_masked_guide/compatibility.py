@@ -30,7 +30,7 @@ TESTED_COMFYUI_VERSION = "0.33.0"
 # so the source itself is the version check. Regenerate with
 # `COMFYUI_PATH=... python tests/regen_fingerprint.py` after reviewing
 # the upstream diff and re-running the equivalence tests.
-TESTED_SOURCE_FINGERPRINT = "fa56c10a6bc313ee1663d9db2d1dd7bceea57620726611b44c581ba46fbc850f"
+TESTED_SOURCE_FINGERPRINT = "fec8b4e5d7f761bfb8e057dd841719ec6179f234f01abc92de3e731e1bcae100"
 
 # (label, dotted path from the H3 module) -- label is hashed too, so reordering
 # or renaming is itself a change.
@@ -42,6 +42,11 @@ FINGERPRINT_SOURCES = (
     ("_mod_row", "_mod_row"),
     ("_mod_scale_shift", "_mod_scale_shift"),
     ("_mod_gate", "_mod_gate"),
+    # The fork hands `final_layer` a per-token row *tensor* whenever a denoise mask
+    # splits the target rows, which is behaviour PR #15375 added. Probing `_mod_row`
+    # alone does not cover it: FinalLayer could stop forwarding the selector while
+    # `_mod_row` still accepts one, and the fork would then quietly diverge.
+    ("FinalLayer.forward", "FinalLayer.forward"),
 )
 
 # Escape hatch for someone who has read the upstream diff and wants to try anyway.
@@ -54,7 +59,7 @@ INCOMPATIBLE = (
 )
 
 _REQUIRED_MODULE_ATTRS = (
-    "MiniMaxH3Model", "PackedLayout", "patchify_video", "unpatchify_video",
+    "MiniMaxH3Model", "PackedLayout", "FinalLayer", "patchify_video", "unpatchify_video",
     "pack_audio", "unpack_audio", "rope_rotation_table", "time_shift_sigma",
     "mask_row_values", "VISUAL_COND_TIMESTEP", "AUDIO_COND_TIMESTEP",
 )
@@ -142,6 +147,50 @@ def _probe_per_token_modulation(module) -> None:
         raise RuntimeError(INCOMPATIBLE.format("_mod_row does not gather per-token modulation rows"))
 
 
+def _probe_final_layer_rows(module) -> None:
+    """PR #15375 also let `FinalLayer` select a per-token modulation row. Prove it does."""
+    final_layer = getattr(module, "FinalLayer", None)
+    if final_layer is None or not hasattr(final_layer, "forward"):
+        raise RuntimeError(INCOMPATIBLE.format("comfy.ldm.minimax.model.FinalLayer is missing"))
+    import inspect
+
+    params = list(inspect.signature(final_layer.forward).parameters)
+    if params[1:] != ["x", "t_emb", "video_seg", "audio_seg"]:
+        raise RuntimeError(INCOMPATIBLE.format(
+            "FinalLayer.forward takes {} rather than (x, t_emb, video_seg, audio_seg)".format(params[1:])))
+
+
+def _probe_wrapper_indexing(module) -> None:
+    """The wrapper rebuilds the chain from `executor.idx + 1`; prove that slice is
+    exactly the wrappers registered after ours, in order, and that they still run.
+
+    `_probe_wrapper_chain` only proves the attributes exist. Their *meaning* is what
+    the fork depends on: if `idx` ever stopped being this wrapper's own position, the
+    rebuilt chain would silently drop or repeat wrappers instead of failing.
+    """
+    import comfy.patcher_extension as ext
+
+    seen = []
+
+    def recorder(tag):
+        def wrapper(executor, *args, **kwargs):
+            seen.append(tag)
+            if tag == "middle":
+                remaining = list(executor.wrappers)[executor.idx + 1:]
+                return ext.WrapperExecutor.new_class_executor(
+                    lambda *a, **kw: "inner", executor.class_obj, remaining).execute(*args, **kwargs)
+            return executor(*args, **kwargs)
+        return wrapper
+
+    result = ext.WrapperExecutor.new_class_executor(
+        lambda: "original", object(), [recorder("first"), recorder("middle"), recorder("last")]
+    ).execute()
+    if seen != ["first", "middle", "last"] or result != "inner":
+        raise RuntimeError(INCOMPATIBLE.format(
+            "WrapperExecutor no longer runs wrappers after `idx` when the chain is rebuilt "
+            "from `wrappers[idx + 1:]` (ran {}, returned {!r})".format(seen, result)))
+
+
 def _probe_keyframe_layout(module) -> None:
     """PR #15439 gives keyframes a `resolved_frame_index` and their own `cond` rows."""
     latent = torch.zeros(1, 24, 1, 4, 6)
@@ -165,8 +214,10 @@ def check_core_compatible() -> None:
     if missing:
         raise RuntimeError(INCOMPATIBLE.format("MiniMaxH3Model is missing " + ", ".join(missing)))
     _probe_per_token_modulation(module)
+    _probe_final_layer_rows(module)
     _probe_keyframe_layout(module)
     _probe_wrapper_chain()
+    _probe_wrapper_indexing(module)
     _check_source_fingerprint(module)
 
 

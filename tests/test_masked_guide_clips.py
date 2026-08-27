@@ -122,9 +122,9 @@ def test_an_unknown_alignment_is_refused(clips):
 
 
 def _strengths(clips, masks, **kwargs):
-    params = dict(width=64, height=32, token_t=2, token_h=1, token_w=2)
+    params = dict(token_t=2, token_h=1, token_w=2)
     params.update(kwargs)
-    return clips.clip_token_strengths(masks, **params)
+    return clips.clip_token_strengths(clips.masks_to_canvas(masks, 64, 32), **params)
 
 
 def test_each_latent_token_pools_only_the_frames_it_was_encoded_from(clips):
@@ -269,3 +269,40 @@ def test_negative_frame_idx_counts_from_the_end_of_the_target(node_module, clips
     positive, _ = _add(node_module, clips, video, masks, frame_idx=-22).result
     # latent_t 37 -> 7 * 17 + 1 + 4 = 124 pixel frames
     assert positive[0][1]["minimax_keyframes"][0]["resolved_frame_index"] == 102
+
+
+# --- the canvas crop happens before the keep decision, not after ----------
+
+
+def test_coverage_is_measured_after_the_canvas_crop(clips):
+    """A subject sitting in a band the cover-crop discards must not pass min_coverage.
+
+    Judged on the raw mask it looks well covered; judged on the canvas it is empty,
+    and it is the canvas that the token pooling will see."""
+    masks = torch.zeros(5, 64, 64)          # 1:1 source
+    masks[:, :12, :] = 1.0                  # only in the top band
+    canvas = clips.masks_to_canvas(masks, 128, 64)   # 2:1 canvas -> crops top/bottom
+    assert float(clips.frame_coverage(masks)[0]) > 0.1        # raw: looks covered
+    assert float(clips.frame_coverage(canvas)[0]) == 0.0      # canvas: nothing left
+    assert clips.frame_keep_flags(canvas).tolist() == [False] * 5
+
+
+def test_a_frame_cropped_empty_never_becomes_an_all_noise_guide(node_module, clips):
+    """The whole point of the keep decision: an all-zero guide is not an absent
+    guide, it is a segment of pure-noise condition tokens riding every step."""
+    video = torch.zeros(5, 64, 64, 3)
+    masks = torch.zeros(5, 64, 64)
+    masks[:, :12, :] = 1.0
+    with pytest.raises(ValueError, match="no guide clips survive"):
+        _add(node_module, clips, video, masks, latent=_av_latent(width=128, height=64))
+
+
+def test_a_subject_the_crop_keeps_still_guides(node_module, clips, forward_module):
+    """The mirror case, so the fix cannot pass by simply dropping everything."""
+    video = torch.zeros(5, 64, 64, 3)
+    masks = torch.zeros(5, 64, 64)
+    masks[:, 16:48, :] = 1.0                # exactly the band a 2:1 crop keeps
+    positive, _ = _add(node_module, clips, video, masks,
+                       latent=_av_latent(width=128, height=64)).result
+    spec = positive[0][1]["minimax_keyframes"][0][forward_module.MASKED_GUIDE_KEY]
+    assert float(spec["strengths"].min()) == 1.0

@@ -83,19 +83,41 @@ def normalize_mask_batch(mask: torch.Tensor) -> torch.Tensor:
     return m.reshape(-1, *m.shape[-2:])
 
 
-def frame_coverage(masks: torch.Tensor) -> torch.Tensor:
-    """Mean mask value per frame, i.e. how much guidance that frame carries."""
-    m = normalize_mask_batch(masks).clamp(0.0, 1.0)
+def masks_to_canvas(masks: torch.Tensor, width: int, height: int) -> torch.Tensor:
+    """One mask per guide frame -> [N, height, width], cover-cropped like the frames.
+
+    Everything downstream -- which frames are worth guiding with, and what each
+    token's strength is -- must be decided on *this* result rather than on the
+    masks as they arrived. The canvas crop can discard a whole subject when the
+    guide's aspect ratio differs from the target's, and a frame measured before
+    the crop but pooled after it can pass `min_coverage` and still produce an
+    all-zero strength grid: not an absent guide, but a full segment of pure-noise
+    condition tokens.
+    """
+    return resize_mask_to_canvas(normalize_mask_batch(masks), width, height)
+
+
+def frame_coverage(canvas_masks: torch.Tensor) -> torch.Tensor:
+    """Mean mask value per frame, i.e. how much guidance that frame carries.
+
+    Expects canvas-space masks from `masks_to_canvas`, so coverage means the
+    fraction of the *canvas* the mask covers -- what the node's tooltip promises,
+    and what the token pooling will actually see.
+    """
+    m = normalize_mask_batch(canvas_masks).clamp(0.0, 1.0)
     return m.reshape(m.shape[0], -1).mean(dim=1)
 
 
-def frame_keep_flags(masks: torch.Tensor, min_coverage: float = 0.0) -> torch.Tensor:
+def frame_keep_flags(canvas_masks: torch.Tensor, min_coverage: float = 0.0) -> torch.Tensor:
     """Per-frame keep flags. A completely masked-out frame guides nothing, so it goes.
+
+    Takes canvas-space masks; see `masks_to_canvas` for why the crop has to come
+    first.
 
     The comparison is strict, so the 0.0 default drops exactly the frames whose
     mask is empty and keeps everything that carries any guidance at all.
     """
-    return frame_coverage(masks) > float(min_coverage)
+    return frame_coverage(canvas_masks) > float(min_coverage)
 
 
 def _runs(flags: torch.Tensor) -> list[tuple[int, int]]:
@@ -146,12 +168,15 @@ def plan_video_guides(keep: torch.Tensor, *, frame_idx: int, frame_count: int,
     return chunks
 
 
-def clip_token_strengths(masks: torch.Tensor, *, width: int, height: int,
+def clip_token_strengths(canvas_masks: torch.Tensor, *,
                          token_t: int, token_h: int, token_w: int,
                          strength: float = 1.0, gamma: float = 1.0,
                          spatial_pooling: str = "average", time_pooling: str = "average",
                          levels: int = MASK_LEVELS) -> torch.Tensor:
-    """One mask per clip frame -> flat per-condition-token strengths, `patchify_video` order.
+    """One canvas-space mask per clip frame -> flat per-token strengths, `patchify_video` order.
+
+    Takes the masks already on the canvas (`masks_to_canvas`) rather than resizing
+    here, so the frames this pools are the same ones `frame_keep_flags` judged.
 
     Time first, then space. `average` treats a token whose frames are half covered
     the way the spatial pooling treats a token half covered, which keeps one policy
@@ -162,13 +187,12 @@ def clip_token_strengths(masks: torch.Tensor, *, width: int, height: int,
         raise ValueError("unknown time pooling {!r}, expected one of {}".format(time_pooling, TIME_POOLING_MODES))
     groups = frame_groups(token_t)
     expected = groups[-1][1] if groups else 0
-    frames = normalize_mask_batch(masks)
-    if frames.shape[0] != expected:
+    canvas = normalize_mask_batch(canvas_masks)
+    if canvas.shape[0] != expected:
         raise ValueError(
             "a {} token guide clip is encoded from {} pixel frames, but {} masks were "
-            "given".format(token_t, expected, frames.shape[0]))
+            "given".format(token_t, expected, canvas.shape[0]))
 
-    canvas = resize_mask_to_canvas(frames, width, height)
     rows = []
     for a, b in groups:
         span = canvas[a:b]

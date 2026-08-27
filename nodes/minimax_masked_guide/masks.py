@@ -192,15 +192,29 @@ def guide_aug_floor(min_aug: float, t_v: float, a_max: float,
     return min(floor, float(a_max))
 
 
-def aug_to_cond_timestep(aug_rows: torch.Tensor, t_v: float,
+def aug_to_cond_timestep(aug_rows: torch.Tensor, t_v: float, a_max: float,
                          floor: bool = True) -> torch.Tensor:
     """Per-token condition timestep for a token corrupted to coefficient a.
 
-    `floor=False` labels the token as noisy as it actually is, so the latent it
-    carries and the modulation row it selects tell H3 the same story -- which is
-    what this function's docstring claimed before the floor was made optional.
     `floor=True` reproduces core's `max(t_v, ...)` guard, under which a token
     holding pure noise is labelled as clean as the target has become.
+
+    `floor=False` labels each token as noisy as it actually is -- *except* at the
+    open end of the mask. A row sitting exactly at `a_max` is a token the mask
+    left fully open, and such a token has to stay a stock guide token in every
+    respect, core's `max(t_v, visual_cond_noise_aug)` tail rule included, or a
+    fully-open mask stops being bit-identical to a stock `MiniMaxH3AddGuide`
+    once `t_v` overtakes `a_max` in the last step or two.
+
+    That endpoint is pinned rather than left to the honest rule for the same
+    reason `strengths_to_aug` pins its own: the invariant outranks the labelling
+    story, and every later observation about masked guides depends on it. The
+    cost is bounded and confined to the open end -- at `t_v > a_max` a fully
+    trusted token is labelled `t_v` rather than `a_max`, exactly as core labels
+    it. Every token the mask actually closes down keeps its honest label.
     """
     rows = aug_rows.to(torch.float64)
-    return torch.clamp(rows, min=float(t_v)) if floor else rows
+    if floor:
+        return torch.clamp(rows, min=float(t_v))
+    stock_cond_t = max(float(t_v), float(a_max))
+    return torch.where(rows >= float(a_max), torch.full_like(rows, stock_cond_t), rows)

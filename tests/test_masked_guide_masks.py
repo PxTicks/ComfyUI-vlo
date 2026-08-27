@@ -82,16 +82,34 @@ def test_strength_map_pins_both_endpoints(masks):
     assert floored[0].item() == 0.3 and floored[-1].item() == 0.999
 
 
-def test_condition_timestep_never_drops_below_the_video_timestep(masks):
+def test_floored_condition_timestep_never_drops_below_the_video_timestep(masks):
     aug = torch.tensor([0.0, 0.4, 0.999], dtype=torch.float64)
-    rows_t = masks.aug_to_cond_timestep(aug, t_v=0.6)
+    rows_t = masks.aug_to_cond_timestep(aug, t_v=0.6, a_max=0.999)
     assert rows_t.tolist() == [0.6, 0.6, 0.999]
     # a fully open guide reproduces core's scalar seg_t["cond"] bit for bit -- which is
     # why the whole strength -> timestep chain stays in float64 (float32 would land on
     # 0.9990000128746033 instead, splitting the modulation table in two)
     stock = masks.strengths_to_aug(torch.ones(1, dtype=torch.float64), a_max=0.999)
-    assert float(masks.aug_to_cond_timestep(stock, 0.6)[0]) == max(0.6, 0.999)
-    assert float(masks.aug_to_cond_timestep(torch.tensor([0.999], dtype=torch.float32), 0.6)[0]) != 0.999
+    assert float(masks.aug_to_cond_timestep(stock, 0.6, a_max=0.999)[0]) == max(0.6, 0.999)
+    assert float(masks.aug_to_cond_timestep(
+        torch.tensor([0.999], dtype=torch.float32), 0.6, a_max=0.999)[0]) != 0.999
+
+
+def test_unfloored_condition_timestep_is_honest_below_the_open_end(masks):
+    aug = torch.tensor([0.0, 0.4, 0.999], dtype=torch.float64)
+    rows_t = masks.aug_to_cond_timestep(aug, t_v=0.6, a_max=0.999, floor=False)
+    assert rows_t.tolist() == [0.0, 0.4, 0.999]      # each token as noisy as it is
+
+
+@pytest.mark.parametrize("t_v,expected", [(0.6, 0.999), (0.9995, 0.9995)])
+def test_the_open_end_always_takes_cores_condition_timestep(masks, t_v, expected):
+    """A token the mask leaves fully open has to stay a stock guide token, tail rule
+    included -- otherwise a fully-open mask stops being bit-identical to stock once
+    t_v overtakes visual_cond_noise_aug."""
+    aug = masks.strengths_to_aug(torch.ones(1, dtype=torch.float64), a_max=0.999)
+    for floor in (True, False):
+        rows_t = masks.aug_to_cond_timestep(aug, t_v=t_v, a_max=0.999, floor=floor)
+        assert float(rows_t[0]) == pytest.approx(expected), floor
 
 
 def test_mask_must_frame_the_same_crop_as_the_image(masks):

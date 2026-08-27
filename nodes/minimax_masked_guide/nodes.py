@@ -24,6 +24,7 @@ from .clips import (
     frame_keep_flags,
     frames_in_latent_t,
     frames_inside_target,
+    masks_to_canvas,
     normalize_mask_batch,
     plan_video_guides,
 )
@@ -59,11 +60,29 @@ def _h3_helpers():
 
 
 def _av_video_latent(latent):
+    """The video stream of an H3 AV latent, with the whole pair's contract checked.
+
+    Both streams are validated, not just the one this returns: a malformed audio
+    stream would otherwise fail somewhere deep in sampling, and a node pack whose
+    stated policy is to fail loudly should not be the thing that lets it through.
+    """
     samples = latent["samples"]
-    if (not samples.is_nested or len(samples.tensors) != 2
-            or samples.tensors[0].ndim != 5 or samples.tensors[0].shape[1] != 24):
-        raise ValueError("this node expects a MiniMax H3 AV latent")
-    return samples.tensors[0]
+    if not samples.is_nested or len(samples.tensors) != 2:
+        raise ValueError("this node expects a MiniMax H3 AV latent (a video/audio nested pair)")
+    video, audio = samples.tensors
+    if video.ndim != 5 or video.shape[1] != 24:
+        raise ValueError(
+            "this node expects a MiniMax H3 AV latent; its video stream should be "
+            "[B, 24, T, H/16, W/16], got {}".format(tuple(video.shape)))
+    if audio.ndim != 4 or audio.shape[1] != 32 or audio.shape[2] != 2:
+        raise ValueError(
+            "this node expects a MiniMax H3 AV latent; its audio stream should be "
+            "[B, 32, 2, T], got {}".format(tuple(audio.shape)))
+    if video.shape[0] != audio.shape[0]:
+        raise ValueError(
+            "MiniMax H3 AV latent streams disagree on batch size: video {}, audio {}".format(
+                video.shape[0], audio.shape[0]))
+    return video
 
 
 def _canvas(video):
@@ -200,8 +219,9 @@ class vloMiniMaxH3AddMaskedGuidesFromVideo(io.ComfyNode):
                                        ">1 pushes mid-tones toward weak guidance, <1 toward strong."),
                 io.Float.Input("min_coverage", default=0.0, min=0.0, max=1.0, step=0.001,
                                tooltip="A frame is dropped when its mask covers no more than this fraction of "
-                                       "the canvas. 0.0 drops exactly the frames whose mask is empty; raise it "
-                                       "to also drop frames where the subject is barely visible."),
+                                       "the canvas, measured after the crop that fits the guide to the target's "
+                                       "framing. 0.0 drops exactly the frames whose mask is empty; raise it to "
+                                       "also drop frames where the subject is barely visible."),
                 io.Combo.Input("time_pooling", options=list(TIME_POOLING_MODES), default="average",
                                tooltip="How the masks of the frames behind one latent token are combined. "
                                        "'average' matches the spatial pooling; 'max' takes their union, which "
@@ -238,8 +258,14 @@ class vloMiniMaxH3AddMaskedGuidesFromVideo(io.ComfyNode):
                 "mask to apply to all of them".format(video.shape[0], masks.shape[0]))
         check_mask_matches_image(masks, video)
 
+        # Crop to the canvas once, up front: which frames are worth guiding with and
+        # what each token's strength is are then decided on the same pixels. Measured
+        # before the crop, a subject sitting in a band the crop discards passes
+        # min_coverage and then pools to an all-zero grid -- which is not an absent
+        # guide but a segment of pure-noise condition tokens.
+        canvas_masks = masks_to_canvas(masks, width, height)
         start = frame_idx if frame_idx >= 0 else frame_count + frame_idx
-        keep = frame_keep_flags(masks, min_coverage)
+        keep = frame_keep_flags(canvas_masks, min_coverage)
         chunks = plan_video_guides(keep, frame_idx=start, frame_count=frame_count,
                                    align=chunk_align)
         if not chunks:
@@ -273,7 +299,7 @@ class vloMiniMaxH3AddMaskedGuidesFromVideo(io.ComfyNode):
                         length, token_t, frames_in_latent_t(token_t)))
 
             strengths = clip_token_strengths(
-                masks[source_start:source_start + length], width=width, height=height,
+                canvas_masks[source_start:source_start + length],
                 token_t=token_t, token_h=token_h, token_w=token_w, strength=strength,
                 gamma=mask_gamma, spatial_pooling="average", time_pooling=time_pooling,
                 levels=MASK_LEVELS)

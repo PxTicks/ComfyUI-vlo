@@ -130,7 +130,8 @@ def build_cond_row_plan(payload, t_v, vis_aug, clock=DEFAULT_GUIDE_CLOCK):
             if clock != "stock":
                 # "stock" leaves rows_t None, which puts the guide back on core's
                 # scalar cond timestep -- corruption without a timestep story.
-                rows_t = aug_to_cond_timestep(aug, t_v, floor=(clock == "floored"))
+                rows_t = aug_to_cond_timestep(aug, t_v, a_max=float(vis_aug),
+                                              floor=(clock == "floored"))
             report.append((index, spec, latent, strengths, aug))
         aug_parts.append(aug)
         if is_keyframe:

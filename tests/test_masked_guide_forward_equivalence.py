@@ -304,10 +304,19 @@ def _plan(fork, strengths, t_v, clock, min_aug=0.0):
     return fork.build_cond_row_plan(payload, t_v=t_v, vis_aug=A_MAX, clock=clock)
 
 
+# timestep 0.5 -> sigma 0.0005 -> t_v 0.9995, i.e. past visual_cond_noise_aug.
+# Core switches its condition label to t_v there; a clock that labels purely by
+# coefficient would stay at 0.999 and silently stop being stock-identical, so the
+# invariant has to be asserted in the tail and not only mid-schedule.
+TAIL_TIMESTEP = 0.5
+
+
 @pytest.mark.parametrize("clock", CLOCKS)
-def test_every_clock_keeps_a_fully_open_mask_bit_identical(model, fork, clock):
+@pytest.mark.parametrize("timestep", [500.0, TAIL_TIMESTEP], ids=["mid_schedule", "t_v_past_vis_aug"])
+def test_every_clock_keeps_a_fully_open_mask_bit_identical(model, fork, clock, timestep):
     """The invariant that outranks all four arms: mask == 1 everywhere is stock."""
     inputs = tiny_inputs()
+    inputs["timestep"] = torch.tensor([timestep])
     expected = _core(model, guide_payload(), inputs)
     strengths = torch.ones(_tokens(guide_payload()), dtype=torch.float64)
     with torch.no_grad():
@@ -315,6 +324,31 @@ def test_every_clock_keeps_a_fully_open_mask_bit_identical(model, fork, clock):
                                      {}, minimax_payload=guide_payload(strengths), clock=clock)
     for got, want in zip(actual, expected):
         assert torch.equal(got, want)
+
+
+def test_matched_pins_the_open_end_without_touching_the_closed_end(fork):
+    """Pinning the endpoint must not leak into the tokens the mask closes down."""
+    n = _tokens(guide_payload())
+    t_v = 0.9995                                   # past vis_aug
+    half = torch.cat([torch.ones(n // 2, dtype=torch.float64),
+                      torch.zeros(n - n // 2, dtype=torch.float64)])
+    rows = _plan(fork, half, t_v=t_v, clock="matched").segment_rows_t[0]
+    assert float(rows[0]) == pytest.approx(t_v)    # open end: core's max(t_v, vis_aug)
+    assert float(rows[-1]) == 0.0                  # closed end: still the noise it is
+
+
+def test_target_relative_really_does_land_on_the_stock_scalar_in_the_tail(fork):
+    """Once t_v passes vis_aug the floor caps at a_max, so *every* row collapses --
+    and it has to collapse onto core's own label, t_v, not onto a_max."""
+    n = _tokens(guide_payload())
+    t_v = 0.9995
+    half = torch.cat([torch.ones(n // 2, dtype=torch.float64),
+                      torch.zeros(n - n // 2, dtype=torch.float64)])
+    plan = _plan(fork, half, t_v=t_v, clock="target_relative")
+    assert float(plan.aug_rows.min()) == A_MAX                  # corruption collapsed
+    rows = plan.segment_rows_t[0]
+    assert rows.unique().numel() == 1                           # one label for the segment
+    assert float(rows[0]) == pytest.approx(t_v)                 # and it is core's
 
 
 def test_matched_labels_a_token_as_noisy_as_it_actually_is(fork):
