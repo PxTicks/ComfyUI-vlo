@@ -248,3 +248,42 @@ def test_debug_stays_silent_when_it_is_off(model, fork, caplog):
         fork.masked_forward(model, inputs["x"], inputs["timestep"], inputs["context"], {},
                             minimax_payload=payload)
     assert "Masked H3 Guide" not in caplog.text
+
+
+# --- guide clips ----------------------------------------------------------
+#
+# `vloMiniMaxH3AddMaskedGuidesFromVideo` anchors multi-frame guides, so a guide
+# latent can carry several time tokens. Core's layout already handles that; what
+# these check is that the fork's per-row bookkeeping spans the whole clip instead
+# of only its first latent frame.
+
+
+def test_fully_open_clip_mask_matches_a_stock_guide_clip(model, fork):
+    inputs = tiny_inputs()
+    clip = dict(latent_t=3, frame_idx=2)
+    expected = _core(model, guide_payload(**clip), inputs)
+    strengths = torch.ones(_tokens(guide_payload(**clip)), dtype=torch.float64)
+    actual = _run(model, fork.masked_forward, guide_payload(strengths, **clip), inputs)
+    for got, want in zip(actual, expected):
+        assert torch.equal(got, want)
+
+
+def test_a_clip_mask_weights_each_latent_frame_on_its_own(model, fork):
+    """A mask that closes down only the clip's last latent frame must not act like
+    one that closes down its first: per-token rows span (t, h, w), not just (h, w)."""
+    clip = dict(latent_t=3, frame_idx=2)
+    inputs = tiny_inputs()
+    rows = _tokens(guide_payload(**clip))
+    per_frame = rows // 3
+
+    head = torch.ones(rows, dtype=torch.float64)
+    head[:per_frame] = 0.0
+    tail = torch.ones(rows, dtype=torch.float64)
+    tail[-per_frame:] = 0.0
+
+    open_out = _run(model, fork.masked_forward, guide_payload(torch.ones(rows, dtype=torch.float64), **clip), inputs)
+    head_out = _run(model, fork.masked_forward, guide_payload(head, **clip), inputs)
+    tail_out = _run(model, fork.masked_forward, guide_payload(tail, **clip), inputs)
+    assert not torch.equal(head_out[0], open_out[0])
+    assert not torch.equal(tail_out[0], open_out[0])
+    assert not torch.equal(head_out[0], tail_out[0])

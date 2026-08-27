@@ -17,6 +17,16 @@ import torch
 import comfy.patcher_extension
 from comfy_api.latest import io
 
+from .clips import (
+    CHUNK_ALIGN_MODES,
+    TIME_POOLING_MODES,
+    clip_token_strengths,
+    frame_keep_flags,
+    frames_in_latent_t,
+    frames_inside_target,
+    normalize_mask_batch,
+    plan_video_guides,
+)
 from .compatibility import check_core_compatible
 from .masked_h3_forward import MASKED_GUIDE_KEY, make_diffusion_model_wrapper
 from .masks import (
@@ -149,6 +159,161 @@ class vloMiniMaxH3AddMaskedGuide(io.ComfyNode):
         return io.NodeOutput(node_helpers.conditioning_set_values(
             positive, {"minimax_keyframes": keyframes}))
 
+
+class vloMiniMaxH3AddMaskedGuidesFromVideo(io.ComfyNode):
+    """Cut a masked video into guide clips and anchor each one as a masked guide."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="vloMiniMaxH3AddMaskedGuidesFromVideo",
+            display_name="MiniMax H3 Add Masked Guides from Video (experimental)",
+            category="model/conditioning/minimax",
+            description=(
+                "Experimental: weight a whole video by a per-frame mask and anchor the result "
+                "as several masked guide clips. Frames whose mask is empty guide nothing and "
+                "are dropped, each surviving run becomes one guide, and each run is rounded "
+                "down to a length MiniMax H3 accepts (1, 5, 22, 39, ... frames). Needs the "
+                "model to be patched with MiniMax H3 Patch Masked Guides; without that patch "
+                "the masks are ignored and the clips behave like stock guides."),
+            inputs=[
+                io.Conditioning.Input("positive"),
+                io.Latent.Input("latent"),
+                io.Vae.Input("vae", tooltip="Video VAE."),
+                io.Image.Input("video", tooltip="Guide frames, at the target video's frame rate."),
+                io.Mask.Input("mask", tooltip="One mask per guide frame (a single mask is applied to all of them). "
+                                              + _MASK_TOOLTIP),
+                io.Int.Input("frame_idx", default=0, min=-9999, max=9999,
+                             tooltip="Target frame the guide video's first frame lines up with. "
+                                     "Negative values count from the end. Guide frames that fall outside "
+                                     "the target video are dropped."),
+                io.Float.Input("strength", default=1.0, min=0.0, max=1.0, step=0.01,
+                               tooltip="Scales every mask. 1.0 leaves a fully open mask identical to a stock guide clip."),
+                io.Float.Input("min_aug", default=0.0, min=0.0, max=1.0, step=0.001,
+                               tooltip="Condition noise-augmentation coefficient a mask value of 0 maps to. "
+                                       "0.0 replaces those guide tokens with pure noise; raise it to keep a floor of guidance."),
+                io.Float.Input("mask_gamma", default=1.0, min=0.1, max=5.0, step=0.05,
+                               tooltip="Exponent applied to the mask before it becomes strength. "
+                                       ">1 pushes mid-tones toward weak guidance, <1 toward strong."),
+                io.Float.Input("min_coverage", default=0.0, min=0.0, max=1.0, step=0.001,
+                               tooltip="A frame is dropped when its mask covers no more than this fraction of "
+                                       "the canvas. 0.0 drops exactly the frames whose mask is empty; raise it "
+                                       "to also drop frames where the subject is barely visible."),
+                io.Combo.Input("time_pooling", options=list(TIME_POOLING_MODES), default="average",
+                               tooltip="How the masks of the frames behind one latent token are combined. "
+                                       "'average' matches the spatial pooling; 'max' takes their union, which "
+                                       "is what a subject moving across those frames needs."),
+                io.Combo.Input("chunk_align", options=list(CHUNK_ALIGN_MODES), default="start",
+                               tooltip="Rounding a run down to a valid clip length drops frames: 'start' keeps "
+                                       "the head of the run, 'center' keeps its middle."),
+            ],
+            outputs=[io.Conditioning.Output(display_name="positive"),
+                     io.String.Output(display_name="plan")],
+        )
+
+    @classmethod
+    def execute(cls, positive, latent, vae, video, mask, frame_idx,
+                strength=1.0, min_aug=0.0, mask_gamma=1.0, min_coverage=0.0,
+                time_pooling="average", chunk_align="start") -> io.NodeOutput:
+        import node_helpers
+
+        check_core_compatible()
+        frame_per_token, resize = _h3_helpers()
+
+        target = _av_video_latent(latent)
+        width, height = _canvas(target)
+        frame_count = sum(frame_per_token[k % 5] for k in range(target.shape[2]))
+
+        masks = normalize_mask_batch(mask)
+        if masks.shape[0] == 1 and video.shape[0] != 1:
+            # A single mask over a clip is a still confidence map, not a per-frame one;
+            # that is a real (if degenerate) request, so broadcast it explicitly.
+            masks = masks.expand(video.shape[0], -1, -1)
+        elif masks.shape[0] != video.shape[0]:
+            raise ValueError(
+                "received {} guide frames and {} masks; pass one mask per frame, or a single "
+                "mask to apply to all of them".format(video.shape[0], masks.shape[0]))
+        check_mask_matches_image(masks, video)
+
+        start = frame_idx if frame_idx >= 0 else frame_count + frame_idx
+        keep = frame_keep_flags(masks, min_coverage)
+        chunks = plan_video_guides(keep, frame_idx=start, frame_count=frame_count,
+                                   align=chunk_align)
+        if not chunks:
+            # Wiring up a video and a mask and silently adding no guidance at all is
+            # exactly the kind of plausible-looking nothing this pack refuses to do.
+            raise ValueError(
+                "no guide clips survive: of {} guide frames anchored at frame {}, {} carry a "
+                "mask above min_coverage {} and none of the runs they form reaches a frame that "
+                "fits inside the target video's {} frames".format(
+                    video.shape[0], start, int(keep.sum()), min_coverage, frame_count))
+
+        keyframes = list(positive[0][1].get("minimax_keyframes", []))
+        report = []
+        total_tokens = 0
+        for source_start, target_start, length in chunks:
+            frames = video[source_start:source_start + length]
+            guide_latent = vae.encode(resize(frames, width, height, "center"))
+            if guide_latent.ndim != 5 or guide_latent.shape[3] % 2 or guide_latent.shape[4] % 2:
+                raise ValueError(
+                    "guide latent {} does not tile into H3's 2x2 condition patches".format(
+                        tuple(guide_latent.shape)))
+            token_t = int(guide_latent.shape[2])
+            token_h = int(guide_latent.shape[3]) // 2
+            token_w = int(guide_latent.shape[4]) // 2
+            if frames_in_latent_t(token_t) != length:
+                # The mask is pooled onto the latent's time grid by FRAME_PER_TOKEN, so a VAE
+                # whose temporal compression differs would slide the mask against the frames.
+                raise ValueError(
+                    "the vae encoded {} guide frames into {} latent time tokens, which cover {} "
+                    "frames on H3's grid; the mask cannot be aligned to that".format(
+                        length, token_t, frames_in_latent_t(token_t)))
+
+            strengths = clip_token_strengths(
+                masks[source_start:source_start + length], width=width, height=height,
+                token_t=token_t, token_h=token_h, token_w=token_w, strength=strength,
+                gamma=mask_gamma, spatial_pooling="average", time_pooling=time_pooling,
+                levels=MASK_LEVELS)
+
+            keyframes.append({
+                "resolved_frame_index": target_start,
+                "latent": guide_latent,
+                # Core ignores the extra key; only the patched forward reads it.
+                MASKED_GUIDE_KEY: {
+                    "strengths": strengths,
+                    "strength": float(strength),
+                    "min_aug": float(min_aug),
+                    "gamma": float(mask_gamma),
+                    "token_t": token_t,
+                    "token_h": token_h,
+                    "token_w": token_w,
+                    "resolved_frame_index": target_start,
+                },
+            })
+            tokens = token_t * token_h * token_w
+            total_tokens += tokens
+            report.append(
+                "  source {}-{} -> target {}-{} ({} frames, {}x{}x{} = {} tokens, "
+                "strength mean {:.3f})".format(
+                    source_start, source_start + length - 1, target_start,
+                    target_start + length - 1, length, token_t, token_h, token_w, tokens,
+                    float(strengths.mean())))
+
+        # The three ways a frame can fail to become guidance are worth telling apart:
+        # an empty mask is the input's business, rounding is this node's.
+        inside = frames_inside_target(keep, frame_idx=start, frame_count=frame_count)
+        guided = sum(length for _, _, length in chunks)
+        plan = "\n".join(
+            ["{} masked guide clip(s) covering {} of {} frames ({} dropped by the mask, "
+             "{} outside the target video, {} to clip-length rounding)".format(
+                 len(chunks), guided, int(video.shape[0]),
+                 int(video.shape[0] - keep.sum()), int(keep.sum() - inside.sum()),
+                 int(inside.sum()) - guided)]
+            + report
+            + ["condition tokens riding every sampling step: {}".format(total_tokens)])
+        return io.NodeOutput(
+            node_helpers.conditioning_set_values(positive, {"minimax_keyframes": keyframes}),
+            plan)
 
 class vloMiniMaxH3PatchMaskedGuides(io.ComfyNode):
     """Install the forked H3 forward pass that reads masked-guide strengths."""

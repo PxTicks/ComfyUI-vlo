@@ -43,6 +43,7 @@ latent?**
 | Node | Role |
 | --- | --- |
 | `MiniMax H3 Add Masked Guide` | `MiniMaxH3AddGuide` plus a strength mask. Stores the pooled token strengths on the keyframe; core still owns timing, layout and VAE encoding. |
+| `MiniMax H3 Add Masked Guides from Video` | Cuts a masked video into guide clips and anchors each one. The helper the segmentation case actually wants. |
 | `MiniMax H3 Patch Masked Guides` | Clones the model and installs the `DIFFUSION_MODEL` wrapper that reads those strengths. Nothing happens without it. |
 | `MiniMax H3 Guide Token Mask Preview` | Renders the strength grid the DiT actually sees, one block per token. Use it whenever mask alignment is in doubt. |
 | `MiniMax H3 Masked Guide: Pixel Fill` | Baseline: mask the guide in pixel space, then feed a stock Add Guide. No patch involved. |
@@ -83,9 +84,10 @@ deliberately deferred.
 ## Structure
 
     masks.py              mask geometry, token pooling, strength -> coefficient map
+    clips.py              video -> guide clips: frame selection, chunking, temporal pooling
     compatibility.py      structural probes against the installed ComfyUI
     masked_h3_forward.py  the fork of MiniMaxH3Model._forward
-    nodes.py              the four nodes
+    nodes.py              the five nodes
 
 `masked_h3_forward.py` is a copy of core's `_forward` with three marked changes.
 Copying it is the point: the values that need changing (`seg_t`, `unique_t`,
@@ -130,19 +132,73 @@ interpretable.
 
 ## Scope
 
-Supported: still-image guides, one mask per guide, arbitrary `frame_idx`,
-multiple masked guides mixed freely with unmasked guides and references, batch
-size 1.
+Supported: still-image guides, guide clips with a time-varying mask, arbitrary
+`frame_idx`, multiple masked guides mixed freely with unmasked guides and
+references, batch size 1.
 
-Not yet: guide clips, guide audio, time-varying masks, masks on reference images,
-sparse token omission.
+Not yet: guide audio, masks on reference images, sparse token omission.
 
-The single-image contract is enforced, not assumed: `Add Masked Guide` refuses
-any `IMAGE` batch other than one frame, and any `MASK` batch other than one mask,
-rather than quietly using the first of each. (Core's `AddGuide` reads a ≥ 5 frame
-batch as a guide clip and a shorter one as its first frame; neither is something
-one mask can weight.) The `Pixel Fill` baseline does take batches — it pairs each
-image with its own mask, or broadcasts a single mask across all of them.
+`Add Masked Guide` stays single-image on purpose, and enforces it rather than
+assuming it: it refuses any `IMAGE` batch other than one frame, and any `MASK`
+batch other than one mask, rather than quietly using the first of each. (Core's
+`AddGuide` reads a ≥ 5 frame batch as a guide clip and a shorter one as its first
+frame; neither is something one mask can weight.) Clips are `Add Masked Guides
+from Video`'s job, because a clip needs a mask per frame *and* a policy for the
+frames that carry no mask at all. The `Pixel Fill` baseline takes batches too —
+it pairs each image with its own mask, or broadcasts a single mask across all of
+them.
+
+## Masked guides from a video
+
+The motivating case is a segmented subject: one source video, one SAM2 mask track,
+and the wish to say "anchor this person, wherever they are, and leave the rest of
+the frame free". That is not one guide. The subject leaves and re-enters, and H3
+only accepts guide clips of **1, 5, 22, 39, ... (17k + 5)** frames, so the mask
+track has to be cut into pieces that fit.
+
+`Add Masked Guides from Video` does the cutting. V1's strategy is deliberately the
+plain one:
+
+1. **Drop the frames that guide nothing.** A frame whose mask is empty contributes
+   a grid of tokens that are all corrupted to noise — pure cost, no guidance. The
+   `min_coverage` threshold decides what counts as empty (`0.0`, the default,
+   catches exactly the all-zero masks).
+2. **One guide per surviving run.** Contiguous kept frames become one clip.
+3. **Round the run down** to the nearest length on the ladder. Rounding has to
+   throw frames away, and `chunk_align` says which end they come off.
+
+Frames landing outside the target video are dropped *before* the runs are measured,
+so a clip is rounded once and always fits. The node outputs a `plan` string saying
+what it built, including the condition-token count — those rows ride through every
+sampling step, so a generous mask over a long video is not free.
+
+### Time-varying masks on the token grid
+
+A clip's latent compresses pixel frames unevenly: `FRAME_PER_TOKEN` is
+`(1, 4, 4, 4, 4)`, so latent frame 0 covers one pixel frame and each of the next
+four covers four. The mask is pooled onto exactly those groups before the spatial
+pooling runs, which is what keeps it from sliding against the frames it annotates.
+
+`time_pooling` is the fork in the road that has no spatial equivalent:
+
+- `average` treats a token whose four frames are half covered the way the spatial
+  pooling treats a token half covered — one policy across both axes;
+- `max` takes the union across the four frames, which is what a subject *moving*
+  through them needs, since averaging smears a moving mask into a weak halo.
+
+### Known crudeness
+
+The strategy is intentionally naive, and it shows in two places worth knowing about
+before reading results:
+
+- **A one-frame mask dropout splits a run.** A 40 frame run with a single empty
+  frame in the middle becomes two 5 frame guides instead of one 39 frame guide.
+  Real SAM2 tracks flicker, so a gap tolerance is the first thing to add.
+- **No repacking.** A 30 frame run becomes one 22 frame guide and 8 wasted frames,
+  where 22 + 5 would have covered 27 of them.
+
+Both live in `plan_video_guides`, which is a pure function over the keep flags, so
+a better strategy is a change to one function and its tests.
 
 ## Running the experiments
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from .nodes import (
     vloMiniMaxH3AddMaskedGuide,
+    vloMiniMaxH3AddMaskedGuidesFromVideo,
     vloMiniMaxH3GuideTokenMaskPreview,
     vloMiniMaxH3MaskedGuidePixelFill,
     vloMiniMaxH3PatchMaskedGuides,
@@ -16,6 +17,7 @@ from .nodes import (
 
 __all__ = [
     "vloMiniMaxH3AddMaskedGuide",
+    "vloMiniMaxH3AddMaskedGuidesFromVideo",
     "vloMiniMaxH3PatchMaskedGuides",
     "vloMiniMaxH3GuideTokenMaskPreview",
     "vloMiniMaxH3MaskedGuidePixelFill",

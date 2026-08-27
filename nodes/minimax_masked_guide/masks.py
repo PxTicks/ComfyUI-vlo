@@ -106,23 +106,30 @@ def quantize_strengths(strengths: torch.Tensor, levels: int = MASK_LEVELS) -> to
     return torch.round(strengths * steps) / steps
 
 
-def guide_token_strengths(mask: torch.Tensor, *, width: int, height: int,
-                          token_t: int, token_h: int, token_w: int,
-                          strength: float = 1.0, gamma: float = 1.0,
-                          pooling: str = "average", levels: int = MASK_LEVELS) -> torch.Tensor:
-    """MASK -> flat per-condition-token strengths in [0, 1], `patchify_video` order.
+def shape_strengths(pooled: torch.Tensor, *, strength: float = 1.0, gamma: float = 1.0,
+                    levels: int = MASK_LEVELS) -> torch.Tensor:
+    """Pooled mask values -> quantized guide strengths in [0, 1].
 
     Returns float64: the strengths become condition timesteps, and matching core's
     python-float timestep bookkeeping exactly is what keeps a fully-open mask on
-    the stock code path (see `strengths_to_aug`).
+    the stock code path (see `strengths_to_aug`). Shared by the still-image and the
+    guide-clip paths so a mask means the same thing on both.
     """
-    canvas = resize_mask_to_canvas(single_mask(mask, label="guide mask"), width, height)
-    pooled = pool_mask_to_tokens(canvas[0], token_h, token_w, pooling)
     s = pooled.to(torch.float64).clamp(0.0, 1.0)
     if gamma != 1.0:
         s = s.pow(float(gamma))
     s = (s * float(strength)).clamp(0.0, 1.0)
-    s = quantize_strengths(s, levels)
+    return quantize_strengths(s, levels)
+
+
+def guide_token_strengths(mask: torch.Tensor, *, width: int, height: int,
+                          token_t: int, token_h: int, token_w: int,
+                          strength: float = 1.0, gamma: float = 1.0,
+                          pooling: str = "average", levels: int = MASK_LEVELS) -> torch.Tensor:
+    """MASK -> flat per-condition-token strengths in [0, 1], `patchify_video` order."""
+    canvas = resize_mask_to_canvas(single_mask(mask, label="guide mask"), width, height)
+    pooled = pool_mask_to_tokens(canvas[0], token_h, token_w, pooling)
+    s = shape_strengths(pooled, strength=strength, gamma=gamma, levels=levels)
     # patchify_video emits rows as (t, h, w); a still guide shares one map across t
     return s.reshape(1, token_h * token_w).expand(token_t, -1).reshape(-1).contiguous()
 
