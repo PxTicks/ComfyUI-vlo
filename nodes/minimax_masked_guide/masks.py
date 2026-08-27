@@ -148,10 +148,59 @@ def strengths_to_aug(strengths: torch.Tensor, a_max: float, a_min: float = 0.0) 
     return torch.where(s <= 0.0, torch.full_like(a, float(a_min)), a)
 
 
-def aug_to_cond_timestep(aug_rows: torch.Tensor, t_v: float) -> torch.Tensor:
-    """Per-token condition timestep, generalizing core's `max(t_v, visual_cond_noise_aug)`.
+# How a guide token's confidence becomes a condition timestep. The four clocks
+# differ along two axes -- what coefficient a mask value of 0 maps to, and whether
+# the modulation label is allowed to disagree with the latent the token carries.
+#
+#   stock            corrupt per token, label every guide row `visual_cond_noise_aug`.
+#                    The baseline: latent corruption with no timestep story at all.
+#   floored          label max(t_v, a), core's `max(t_v, visual_cond_noise_aug)` with
+#                    the coefficient substituted in. The floor never fires for core
+#                    (a is pinned at 0.999); here it fires constantly, and a token
+#                    holding pure noise gets labelled as partly informative.
+#   matched          label a. What `aug_to_cond_timestep` was always documented to do.
+#   target_relative  a mask value of 0 lands the token level with the *target* rather
+#                    than at pure noise, then labels it there. This is core's own
+#                    denoise-mask row formula -- `t = 1 - m*sigma` -- read backwards,
+#                    with guide confidence playing the role of `1 - m`. A zero-
+#                    confidence token then carries no *marginal* information rather
+#                    than no information; that is a different promise from the other
+#                    three, and deliberately so.
+GUIDE_CLOCKS = ("stock", "floored", "matched", "target_relative")
+DEFAULT_GUIDE_CLOCK = "matched"
 
-    A token corrupted to coefficient a is labelled as noisy as it actually is, so
-    the latent it carries and the modulation row it selects tell H3 the same story.
+
+def check_guide_clock(clock: str) -> str:
+    if clock not in GUIDE_CLOCKS:
+        raise ValueError("unknown guide clock {!r}, expected one of {}".format(clock, GUIDE_CLOCKS))
+    return clock
+
+
+def guide_aug_floor(min_aug: float, t_v: float, a_max: float,
+                    clock: str = DEFAULT_GUIDE_CLOCK) -> float:
+    """The coefficient a mask value of 0 maps to, under `clock`.
+
+    Only `target_relative` moves with the schedule. Raising the floor to `t_v` is
+    what makes a zero-confidence token sit exactly where the target sits; the cap at
+    `a_max` matters at the very end of sampling, where `t_v` overtakes the condition
+    timestep and every guide row collapses back onto the stock scalar path.
     """
-    return torch.clamp(aug_rows.to(torch.float64), min=float(t_v))
+    check_guide_clock(clock)
+    floor = max(float(min_aug), 0.0)
+    if clock == "target_relative":
+        floor = max(floor, float(t_v))
+    return min(floor, float(a_max))
+
+
+def aug_to_cond_timestep(aug_rows: torch.Tensor, t_v: float,
+                         floor: bool = True) -> torch.Tensor:
+    """Per-token condition timestep for a token corrupted to coefficient a.
+
+    `floor=False` labels the token as noisy as it actually is, so the latent it
+    carries and the modulation row it selects tell H3 the same story -- which is
+    what this function's docstring claimed before the floor was made optional.
+    `floor=True` reproduces core's `max(t_v, ...)` guard, under which a token
+    holding pure noise is labelled as clean as the target has become.
+    """
+    rows = aug_rows.to(torch.float64)
+    return torch.clamp(rows, min=float(t_v)) if floor else rows

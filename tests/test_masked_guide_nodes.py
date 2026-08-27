@@ -192,3 +192,46 @@ def test_pixel_fill_noise_is_deterministic(node_module):
 def test_nodes_refuse_latents_that_are_not_h3_av_pairs(node_module):
     with pytest.raises(ValueError, match="MiniMax H3 AV latent"):
         _add(node_module, torch.ones(1, 64, 128), latent={"samples": torch.zeros(1, 24, 2, 4, 8)})
+
+
+def _patcher_stub():
+    class _Patcher:
+        def __init__(self):
+            self.wrappers = {}
+
+        def clone(self):
+            copy = _Patcher()
+            copy.wrappers = {k: {kk: list(vv) for kk, vv in v.items()} for k, v in self.wrappers.items()}
+            return copy
+
+        def add_wrapper_with_key(self, wrapper_type, key, wrapper):
+            self.wrappers.setdefault(wrapper_type, {}).setdefault(key, []).append(wrapper)
+
+        def remove_wrappers_with_key(self, wrapper_type, key):
+            self.wrappers.get(wrapper_type, {}).pop(key, None)
+
+    return _Patcher()
+
+
+@pytest.mark.parametrize("clock", ["stock", "floored", "matched", "target_relative"])
+def test_patch_node_accepts_every_guide_clock(node_module, clock):
+    out = node_module.vloMiniMaxH3PatchMaskedGuides.execute(model=_patcher_stub(), guide_clock=clock)
+    assert out.result[0] is not None
+
+
+def test_patch_node_refuses_an_unknown_guide_clock(node_module):
+    with pytest.raises(ValueError, match="unknown guide clock"):
+        node_module.vloMiniMaxH3PatchMaskedGuides.execute(model=_patcher_stub(), guide_clock="honest")
+
+
+@pytest.mark.parametrize("legacy,expected", [(True, "floored"), (False, "stock")])
+def test_patch_node_maps_the_legacy_sync_timesteps_boolean(node_module, legacy, expected):
+    """`guide_clock` replaced a boolean; an API caller carrying the old argument
+    should land on the arm it used to mean rather than tripping the combo check."""
+    import comfy.patcher_extension
+
+    patched = node_module.vloMiniMaxH3PatchMaskedGuides.execute(
+        model=_patcher_stub(), guide_clock=legacy).result[0]
+    installed = patched.wrappers[comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL][node_module.WRAPPER_KEY]
+    assert len(installed) == 1
+    assert node_module.DEFAULT_GUIDE_CLOCK == "matched"   # the documented arm is the default

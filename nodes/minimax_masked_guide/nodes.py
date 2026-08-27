@@ -30,7 +30,10 @@ from .clips import (
 from .compatibility import check_core_compatible
 from .masked_h3_forward import MASKED_GUIDE_KEY, make_diffusion_model_wrapper
 from .masks import (
+    DEFAULT_GUIDE_CLOCK,
+    GUIDE_CLOCKS,
     MASK_LEVELS,
+    check_guide_clock,
     check_mask_matches_image,
     guide_token_strengths,
     resize_mask_to_canvas,
@@ -330,11 +333,16 @@ class vloMiniMaxH3PatchMaskedGuides(io.ComfyNode):
                 "condition timestep. Samples without a masked guide run the stock path."),
             inputs=[
                 io.Model.Input("model"),
-                io.Boolean.Input("sync_timesteps", default=True,
-                                 tooltip="On: each corrupted guide token also gets a matching condition "
-                                         "timestep / AdaLN row. Off: only the latent is corrupted and the "
-                                         "guide keeps one global timestep -- the baseline this feature is "
-                                         "meant to beat."),
+                io.Combo.Input("guide_clock", options=list(GUIDE_CLOCKS), default=DEFAULT_GUIDE_CLOCK,
+                               tooltip="How a guide token's confidence becomes a condition timestep. "
+                                       "'stock': corrupt the latent only, every guide row keeps one global "
+                                       "timestep -- the baseline this feature has to beat. "
+                                       "'floored': label each token max(t_v, a), core's guard carried over; "
+                                       "a token holding pure noise ends up labelled as clean as the target has "
+                                       "become. 'matched': label each token as noisy as it actually is. "
+                                       "'target_relative': a zero-confidence token sits level with the target "
+                                       "instead of at pure noise, so it carries no *marginal* information -- "
+                                       "core's own denoise-mask row formula, read backwards."),
                 io.Boolean.Input("debug", default=False,
                                  tooltip="Log one masked-guide report per sampling run."),
             ],
@@ -342,15 +350,20 @@ class vloMiniMaxH3PatchMaskedGuides(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, sync_timesteps=True, debug=False) -> io.NodeOutput:
+    def execute(cls, model, guide_clock=DEFAULT_GUIDE_CLOCK, debug=False) -> io.NodeOutput:
         check_core_compatible()
+        if isinstance(guide_clock, bool):
+            # Tolerate the boolean `sync_timesteps` this input replaced, so an API
+            # caller carrying the old argument lands on the arm it used to mean.
+            guide_clock = "floored" if guide_clock else "stock"
+        check_guide_clock(guide_clock)
         patched = model.clone()
         # re-patching replaces rather than stacks, so chaining the node twice is harmless
         patched.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, WRAPPER_KEY)
         patched.add_wrapper_with_key(
             comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
             WRAPPER_KEY,
-            make_diffusion_model_wrapper(sync_timesteps=sync_timesteps, debug=debug),
+            make_diffusion_model_wrapper(clock=guide_clock, debug=debug),
         )
         return io.NodeOutput(patched)
 

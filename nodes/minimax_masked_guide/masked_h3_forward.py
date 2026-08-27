@@ -30,7 +30,13 @@ import comfy.model_prefetch
 import comfy.patcher_extension
 
 from .compatibility import h3_module, is_h3_diffusion_model
-from .masks import aug_to_cond_timestep, strengths_to_aug
+from .masks import (
+    DEFAULT_GUIDE_CLOCK,
+    aug_to_cond_timestep,
+    check_guide_clock,
+    guide_aug_floor,
+    strengths_to_aug,
+)
 
 
 # Key under which `vloMiniMaxH3AddMaskedGuide` stores its spec on a keyframe dict.
@@ -92,8 +98,15 @@ class CondRowPlan:
         self.report = report
 
 
-def build_cond_row_plan(payload, t_v, vis_aug, sync_timesteps=True):
-    """vlo: change A -- flatten the guide masks into per-condition-row values."""
+def build_cond_row_plan(payload, t_v, vis_aug, clock=DEFAULT_GUIDE_CLOCK):
+    """vlo: change A -- flatten the guide masks into per-condition-row values.
+
+    `clock` picks how confidence becomes a coefficient and a timestep; see
+    `masks.GUIDE_CLOCKS`. Everything else is shared, so the four arms differ only
+    in the floor `strengths_to_aug` interpolates up from and in whether the label
+    is allowed to disagree with the latent.
+    """
+    check_guide_clock(clock)
     conditions = _visual_conditions(payload)
 
     aug_parts = []
@@ -111,13 +124,17 @@ def build_cond_row_plan(payload, t_v, vis_aug, sync_timesteps=True):
                     "masked guide row alignment failed: guide {} carries {} token strengths "
                     "but its condition latent {} patchifies to {} rows".format(
                         index, strengths.numel(), tuple(latent.shape), n_rows))
-            min_aug = min(max(float(spec.get("min_aug", 0.0)), 0.0), float(vis_aug))
-            aug = strengths_to_aug(strengths, a_max=float(vis_aug), a_min=min_aug)
-            rows_t = aug_to_cond_timestep(aug, t_v)
+            a_min = guide_aug_floor(float(spec.get("min_aug", 0.0)), t_v,
+                                    a_max=float(vis_aug), clock=clock)
+            aug = strengths_to_aug(strengths, a_max=float(vis_aug), a_min=a_min)
+            if clock != "stock":
+                # "stock" leaves rows_t None, which puts the guide back on core's
+                # scalar cond timestep -- corruption without a timestep story.
+                rows_t = aug_to_cond_timestep(aug, t_v, floor=(clock == "floored"))
             report.append((index, spec, latent, strengths, aug))
         aug_parts.append(aug)
         if is_keyframe:
-            segment_rows_t.append(rows_t if sync_timesteps else None)
+            segment_rows_t.append(rows_t)
 
     return CondRowPlan(torch.cat(aug_parts) if aug_parts else None, segment_rows_t, report)
 
@@ -159,11 +176,12 @@ def masked_cond_video_rows(model, payload, device, aug_rows):
     return torch.cat(rows, dim=0) if rows else None
 
 
-def _log_plan(payload, plan, layout, debug):
+def _log_plan(payload, plan, layout, debug, clock=DEFAULT_GUIDE_CLOCK):
     """One report per sampling run, not per step."""
     if not debug or payload.get("_vlo_masked_guide_logged"):
         return
     payload["_vlo_masked_guide_logged"] = True
+    logging.info("Masked H3 Guides: clock=%s", clock)
     cond_rows = sum(b - a for a, b, kind in layout.segments if kind == "cond")
     for index, spec, latent, strengths, aug in plan.report:
         logging.info(
@@ -180,7 +198,7 @@ def _log_plan(payload, plan, layout, debug):
 
 def masked_forward(model, x, timestep, context, transformer_options={}, minimax_payload=None,
                    denoise_mask=None, audio_denoise_mask=None,
-                   sync_timesteps=True, debug=False, **kwargs):
+                   clock=DEFAULT_GUIDE_CLOCK, debug=False, **kwargs):
     module = h3_module()
     patchify_video = module.patchify_video
     unpatchify_video = module.unpatchify_video
@@ -221,8 +239,8 @@ def masked_forward(model, x, timestep, context, transformer_options={}, minimax_
              "cond_audio": max(t_a, aud_aug), "ref_audio": max(t_a, aud_aug)}
 
     # vlo: change A -- per-condition-row augmentation coefficients and timesteps
-    plan = build_cond_row_plan(payload, t_v, vis_aug, sync_timesteps=sync_timesteps)
-    _log_plan(payload, plan, layout, debug)
+    plan = build_cond_row_plan(payload, t_v, vis_aug, clock=clock)
+    _log_plan(payload, plan, layout, debug, clock)
     cond_seg_rows_t = list(plan.segment_rows_t)
 
     # masked rows run at their own strength: mask value m puts a row at sigma = m * sigma_stream,
@@ -409,7 +427,7 @@ def masked_forward(model, x, timestep, context, transformer_options={}, minimax_
     return [-video_out.to(video_x.dtype), -audio_out.to(audio_x.dtype)]
 
 
-def make_diffusion_model_wrapper(sync_timesteps=True, debug=False):
+def make_diffusion_model_wrapper(clock=DEFAULT_GUIDE_CLOCK, debug=False):
     """A `WrappersMP.DIFFUSION_MODEL` wrapper that only diverts masked-guide samples.
 
     On a masked sample this does *not* short-circuit the chain. It rebuilds the
@@ -428,7 +446,7 @@ def make_diffusion_model_wrapper(sync_timesteps=True, debug=False):
 
         def replacement(*inner_args, **inner_kwargs):
             # stands in for the bound MiniMaxH3Model._forward, so it takes no self
-            return masked_forward(model, *inner_args, sync_timesteps=sync_timesteps,
+            return masked_forward(model, *inner_args, clock=clock,
                                   debug=debug, **inner_kwargs)
 
         remaining = list(executor.wrappers)[executor.idx + 1:]

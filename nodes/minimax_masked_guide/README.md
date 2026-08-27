@@ -33,10 +33,35 @@ innermost function and lets the rest of the wrapper chain run, so patches added
 after this node (EasyCache, block swap, …) still apply and the result does not
 depend on the order the model patch nodes were chained in.
 
-`sync_timesteps` on the patch node turns step 2 off, leaving step 1 in place.
-That is the A/B the whole feature has to win: **does synchronizing guide-token
+`guide_clock` on the patch node selects how step 2 is done, or turns it off. That
+is the A/B the whole feature has to win: **does synchronizing guide-token
 corruption with guide-token timestep materially beat simply corrupting the
 latent?**
+
+| `guide_clock` | coefficient a mask value of 0 maps to | modulation label |
+| --- | --- | --- |
+| `stock` | `min_aug` | one global `max(t_v, 0.999)` for the whole guide |
+| `floored` | `min_aug` | `max(t_v, a)` |
+| `matched` *(default)* | `min_aug` | `a` |
+| `target_relative` | `max(min_aug, t_v)` | `a` |
+
+`stock` is step 1 alone — the baseline. `floored` is core's
+`max(t_v, visual_cond_noise_aug)` with the coefficient substituted in; the guard
+never fires for core, because `a` is pinned at `0.999`, but here it fires on
+almost every step and a token holding pure noise ends up labelled as clean as the
+target has become. `matched` drops that floor, which is what this package always
+documented itself as doing.
+
+`target_relative` is the interesting one. Core already has trained per-row
+timestep semantics for exactly this axis — a partially denoised *video* row is
+labelled `t = 1 - m*sigma`, where `m` is its denoise mask. Guide confidence runs
+the same axis backwards (`s = 1 - m`), so this clock reuses core's own formula:
+a fully trusted token sits at `0.999`, and a zero-confidence token sits exactly
+level with the target. Note that this **changes what `s = 0` means** — the token
+no longer carries *no* information, it carries no *marginal* information, which
+is a different promise from the other three arms. If you want `s = 0` to mean the
+guide is genuinely absent, no timestep formula delivers that; only omitting the
+token does, and that is still deferred (see below).
 
 ## Nodes
 
@@ -44,7 +69,7 @@ latent?**
 | --- | --- |
 | `MiniMax H3 Add Masked Guide` | `MiniMaxH3AddGuide` plus a strength mask. Stores the pooled token strengths on the keyframe; core still owns timing, layout and VAE encoding. |
 | `MiniMax H3 Add Masked Guides from Video` | Cuts a masked video into guide clips and anchors each one. The helper the segmentation case actually wants. |
-| `MiniMax H3 Patch Masked Guides` | Clones the model and installs the `DIFFUSION_MODEL` wrapper that reads those strengths. Nothing happens without it. |
+| `MiniMax H3 Patch Masked Guides` | Clones the model and installs the `DIFFUSION_MODEL` wrapper that reads those strengths. Nothing happens without it. Carries `guide_clock`. |
 | `MiniMax H3 Guide Token Mask Preview` | Renders the strength grid the DiT actually sees, one block per token. Use it whenever mask alignment is in doubt. |
 | `MiniMax H3 Masked Guide: Pixel Fill` | Baseline: mask the guide in pixel space, then feed a stock Add Guide. No patch involved. |
 
@@ -216,7 +241,11 @@ Work synthetic before real. Suggested order:
    continuous rather than an accidental threshold.
 5. **Discrete strengths** — `s ∈ {0, 0.25, 0.5, 0.75, 1}`, measuring similarity at
    the guide frame. Expect broadly monotonic, not linear.
-6. **`sync_timesteps` on vs off** at the same mask — the central experiment.
+6. **`guide_clock` across all four arms** at the same mask — the central
+   experiment. `stock` vs `matched` is the original question; `floored` vs
+   `matched` isolates whether core's carried-over floor was doing harm; and
+   `target_relative` asks whether a zero-confidence token is better off level
+   with the target than at pure noise.
 7. **Pixel-fill baseline** vs both of the above.
 8. **Segmented human subject** — the motivating case. Look for identity
    preservation, pose anchoring, background contamination from the guide,

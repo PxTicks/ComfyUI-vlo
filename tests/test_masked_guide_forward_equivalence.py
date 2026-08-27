@@ -103,22 +103,22 @@ def test_partial_mask_only_perturbs_through_the_guide(model, fork):
     assert not torch.equal(out, open_out) and not torch.equal(out, closed_out)
 
 
-def test_sync_timesteps_off_differs_from_on(model, fork):
+def test_stock_clock_differs_from_matched(model, fork):
     """The central experiment's A/B: latent corruption alone vs corruption + timestep."""
     inputs = tiny_inputs()
     n = _tokens(guide_payload())
     strengths = torch.full((n,), 0.4, dtype=torch.float64)
     with torch.no_grad():
         synced = fork.masked_forward(model, inputs["x"], inputs["timestep"], inputs["context"], {},
-                                     minimax_payload=guide_payload(strengths), sync_timesteps=True)
+                                     minimax_payload=guide_payload(strengths), clock="matched")
         noise_only = fork.masked_forward(model, inputs["x"], inputs["timestep"], inputs["context"], {},
-                                         minimax_payload=guide_payload(strengths), sync_timesteps=False)
+                                         minimax_payload=guide_payload(strengths), clock="stock")
     assert not torch.equal(synced[0], noise_only[0])
 
 
 def test_noise_only_mode_keeps_the_stock_condition_timestep(model, fork):
     payload = guide_payload(torch.full((_tokens(guide_payload()),), 0.4, dtype=torch.float64))
-    plan = fork.build_cond_row_plan(payload, t_v=0.5, vis_aug=0.999, sync_timesteps=False)
+    plan = fork.build_cond_row_plan(payload, t_v=0.5, vis_aug=0.999, clock="stock")
     assert plan.segment_rows_t == [None]
     assert plan.aug_rows is not None and float(plan.aug_rows.max()) < 0.999
 
@@ -287,3 +287,101 @@ def test_a_clip_mask_weights_each_latent_frame_on_its_own(model, fork):
     assert not torch.equal(head_out[0], open_out[0])
     assert not torch.equal(tail_out[0], open_out[0])
     assert not torch.equal(head_out[0], tail_out[0])
+
+
+# --- guide clocks ---------------------------------------------------------
+#
+# Four ways to turn a token's confidence into a condition timestep. They differ
+# only in the floor the coefficient interpolates up from and in whether the
+# modulation label is allowed to disagree with the latent the token carries.
+
+CLOCKS = ("stock", "floored", "matched", "target_relative")
+A_MAX = 0.999
+
+
+def _plan(fork, strengths, t_v, clock, min_aug=0.0):
+    payload = guide_payload(strengths, min_aug=min_aug)
+    return fork.build_cond_row_plan(payload, t_v=t_v, vis_aug=A_MAX, clock=clock)
+
+
+@pytest.mark.parametrize("clock", CLOCKS)
+def test_every_clock_keeps_a_fully_open_mask_bit_identical(model, fork, clock):
+    """The invariant that outranks all four arms: mask == 1 everywhere is stock."""
+    inputs = tiny_inputs()
+    expected = _core(model, guide_payload(), inputs)
+    strengths = torch.ones(_tokens(guide_payload()), dtype=torch.float64)
+    with torch.no_grad():
+        actual = fork.masked_forward(model, inputs["x"], inputs["timestep"], inputs["context"],
+                                     {}, minimax_payload=guide_payload(strengths), clock=clock)
+    for got, want in zip(actual, expected):
+        assert torch.equal(got, want)
+
+
+def test_matched_labels_a_token_as_noisy_as_it_actually_is(fork):
+    """The arm the docstring always described: no floor, so label == coefficient."""
+    n = _tokens(guide_payload())
+    plan = _plan(fork, torch.zeros(n, dtype=torch.float64), t_v=0.43, clock="matched")
+    assert float(plan.aug_rows.max()) == 0.0
+    assert float(plan.segment_rows_t[0].max()) == 0.0      # honest: pure noise is t=0
+
+
+def test_floored_labels_a_pure_noise_token_as_clean_as_the_target(fork):
+    """Core's guard carried over. The lie this arm tells is the whole reason for the others."""
+    n = _tokens(guide_payload())
+    plan = _plan(fork, torch.zeros(n, dtype=torch.float64), t_v=0.43, clock="floored")
+    assert float(plan.aug_rows.max()) == 0.0               # content is still pure noise
+    assert float(plan.segment_rows_t[0].min()) == pytest.approx(0.43)
+
+
+def test_target_relative_puts_a_zero_confidence_token_level_with_the_target(fork):
+    """core's `t = 1 - m*sigma` read backwards, with guide confidence as `1 - m`."""
+    n = _tokens(guide_payload())
+    for t_v in (0.0, 0.25, 0.43):
+        plan = _plan(fork, torch.zeros(n, dtype=torch.float64), t_v=t_v, clock="target_relative")
+        # content and label both sit at t_v -- no marginal information, and no lie
+        assert float(plan.aug_rows.max()) == pytest.approx(t_v)
+        assert float(plan.segment_rows_t[0].max()) == pytest.approx(t_v)
+
+
+def test_target_relative_leaves_the_open_end_of_the_mask_pinned(fork):
+    """Raising the floor must not drag the trusted end off `visual_cond_noise_aug`."""
+    n = _tokens(guide_payload())
+    s = torch.ones(n, dtype=torch.float64)
+    plan = _plan(fork, s, t_v=0.43, clock="target_relative")
+    assert float(plan.aug_rows.min()) == A_MAX
+
+
+def test_target_relative_collapses_to_stock_once_the_target_overtakes_the_guide(fork):
+    """Late in sampling t_v passes the condition timestep; the mask then stops mattering."""
+    n = _tokens(guide_payload())
+    plan = _plan(fork, torch.zeros(n, dtype=torch.float64), t_v=0.9999, clock="target_relative")
+    assert float(plan.aug_rows.min()) == A_MAX             # floor capped at a_max
+    assert plan.segment_rows_t[0].unique().numel() == 1    # -> back on the scalar path
+
+
+def test_min_aug_still_raises_the_floor_under_every_clock(fork):
+    n = _tokens(guide_payload())
+    for clock in CLOCKS:
+        plan = _plan(fork, torch.zeros(n, dtype=torch.float64), t_v=0.1, clock=clock, min_aug=0.3)
+        assert float(plan.aug_rows.max()) == pytest.approx(0.3), clock
+
+
+def test_the_four_clocks_are_actually_different(model, fork):
+    inputs = tiny_inputs()
+    strengths = torch.full((_tokens(guide_payload()),), 0.4, dtype=torch.float64)
+    outs = {}
+    for clock in CLOCKS:
+        with torch.no_grad():
+            outs[clock] = fork.masked_forward(
+                model, inputs["x"], inputs["timestep"], inputs["context"], {},
+                minimax_payload=guide_payload(strengths), clock=clock)[0]
+    for a in CLOCKS:
+        for b in CLOCKS:
+            if a < b:
+                assert not torch.equal(outs[a], outs[b]), "{} == {}".format(a, b)
+
+
+def test_an_unknown_clock_is_refused(fork):
+    with pytest.raises(ValueError, match="unknown guide clock"):
+        _plan(fork, torch.zeros(_tokens(guide_payload()), dtype=torch.float64),
+              t_v=0.1, clock="honest")
