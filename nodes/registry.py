@@ -14,10 +14,42 @@ from typing import Any
 import folder_paths
 from aiohttp import web
 
-from ..media_registry import MediaItem, MediaRegistry
+from ..media_registry import (
+    MediaItem,
+    MediaRegistry,
+    collect_media_ids_from_queue,
+)
 
 
-REGISTRY = MediaRegistry()
+def _media_ids_in_flight() -> set[str] | None:
+    """Media ids named by prompts ComfyUI is running or has queued.
+
+    This is what makes retention correct for a submitted-ahead batch: its
+    copies all reference one registry item and read it minutes apart, so read
+    recency alone would expire media the queue still depends on.
+
+    Returns None when the queue cannot be read, which the registry treats as
+    "keep everything" rather than guessing.
+    """
+
+    try:
+        from server import PromptServer  # Imported late: ComfyUI owns it.
+
+        queue = PromptServer.instance.prompt_queue
+        # The volatile variant shallow-copies under the mutex; the plain one
+        # deep-copies every queued prompt, which is far too much work for
+        # something on the path of every media read. It is also the newer of
+        # the two, and this package runs against whatever ComfyUI the user has.
+        read_queue = getattr(queue, "get_current_queue_volatile", None) or (
+            queue.get_current_queue
+        )
+        running, pending = read_queue()
+    except Exception:
+        return None
+    return collect_media_ids_from_queue((*running, *pending))
+
+
+REGISTRY = MediaRegistry(referenced_ids_provider=_media_ids_in_flight)
 
 
 _DEFAULT_CONTENT_TYPES = {

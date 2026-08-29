@@ -115,7 +115,11 @@ async def view_memory_media(request: web.Request) -> web.Response:
 @PromptServer.instance.routes.get("/api/vlo-memory/item/{media_id}")
 async def get_memory_media_item(request: web.Request) -> web.Response:
     media_id = request.match_info.get("media_id", "")
-    item = REGISTRY.get(media_id)
+    # Metadata, not a read: this is what vlo's backend probes before reusing an
+    # id for a batch sibling. Marking it accessed would drop the item from the
+    # unread TTL to the far shorter accessed one at submission time, before any
+    # generation had actually consumed it.
+    item = REGISTRY.get(media_id, mark_accessed=False)
     if item is None:
         return _json_error(404, "Unknown media id")
     return web.json_response(_media_summary(item))
