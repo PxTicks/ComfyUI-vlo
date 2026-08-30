@@ -69,6 +69,10 @@ token does, and that is still deferred (see below).
 | --- | --- |
 | `MiniMax H3 Add Masked Guide` | `MiniMaxH3AddGuide` plus a strength mask. Stores the pooled token strengths on the keyframe; core still owns timing, layout and VAE encoding. |
 | `MiniMax H3 Add Masked Guides from Video` | Cuts a masked video into guide clips and anchors each one. The helper the segmentation case actually wants. |
+| `MiniMax H3 Build Guide Spec` | Plans a still guide (align, encode, weight) without touching the conditioning, so both conditioning paths can read one plan. |
+| `MiniMax H3 Build Guide Spec from Video` | The same for a masked video: chunking, rounding and per-clip strengths, as a spec. |
+| `MiniMax H3 Add Guides from Spec` | Anchors a spec's clips on the conditioning — the latent half of a guide. |
+| `MiniMax H3 Apply Semantic Guides` | Wraps the CLIP so a full-confidence guide is *also* shown to Qwen, timestamped — the semantic half. |
 | `MiniMax H3 Patch Masked Guides` | Clones the model and installs the `DIFFUSION_MODEL` wrapper that reads those strengths. Nothing happens without it. Carries `guide_clock`. |
 | `MiniMax H3 Guide Token Mask Preview` | Renders the strength grid the DiT actually sees, one block per token. Use it whenever mask alignment is in doubt. |
 | `MiniMax H3 Masked Guide: Pixel Fill` | Baseline: mask the guide in pixel space, then feed a stock Add Guide. No patch involved. |
@@ -114,9 +118,11 @@ deliberately deferred.
 
     masks.py              mask geometry, token pooling, strength -> coefficient map
     clips.py              video -> guide clips: frame selection, chunking, temporal pooling
+    guides.py             the guide spec: one plan, read by both conditioning paths
+    semantic.py           the Qwen half: timed <Video k> presentation, CLIP wrapper
     compatibility.py      structural probes against the installed ComfyUI
     masked_h3_forward.py  the fork of MiniMaxH3Model._forward
-    nodes.py              the five nodes
+    nodes.py              the nine nodes
 
 `masked_h3_forward.py` is a copy of core's `_forward` with three marked changes.
 Copying it is the point: the values that need changing (`seg_t`, `unique_t`,
@@ -261,6 +267,124 @@ before reading results:
 
 Both live in `plan_video_guides`, which is a pure function over the keep flags, so
 a better strategy is a change to one function and its tests.
+
+## Semantic guides: the same guide, also shown to Qwen
+
+MiniMax H3 conditions on a guide through two channels, and stock ComfyUI already
+uses both for first/last-frame guides — `MiniMaxH3ImageToVideo` hands the guide
+image to `clip.tokenize(..., images=...)` *and* VAE-encodes it as a keyframe:
+
+    full guide
+       ├── canvas-aligned pixels ── VAE ──── H3 keyframe at frame N
+       └── the same pixels ─────── Qwen ─── semantic reference at N/24
+
+What has no stock equivalent is the second arrow for a guide anchored at an
+arbitrary frame: the `<Picture N>` presentation carries no time. H3's *other*
+presentation does. A `<Video k>` reference is emitted as
+
+    "<Video k>: " ("<T.T seconds>" <2-frame vision block>)*
+
+and core's tokenizer takes the timestamp list as a parameter, defaulting it to
+2 fps only because that is how `MiniMaxH3ReferenceToVideo` samples. Handing it
+target-timeline timestamps instead is the whole mechanism — no tokenizer fork, no
+new vocabulary, just the arbitrary-time presentation H3 already speaks.
+
+### It is deliberately not a masking feature
+
+Semantic conditioning is offered only to a guide whose **every** condition token
+came out at exactly full strength. Qwen has no way to represent the spatial
+confidence map the DiT path uses; showing it a masked guide would hand it visual
+information the latent guide explicitly says is absent or unreliable, and would
+let it bypass a `strength` the user deliberately lowered.
+
+The test is on the *final* strengths, after canvas alignment, spatial pooling,
+temporal pooling, gamma, global strength and quantization — not on the input
+mask. It is exact equality with 1.0 rather than a threshold, and that is safe
+precisely because `shape_strengths` quantizes onto the `MASK_LEVELS` ladder
+first: a white mask that resampling left at 0.99999994 rounds back to exactly
+1.0, while a genuine 0.99 lands two steps below. Eligibility is per chunk, so one
+weakened run does not veto a complete one.
+
+So for a still, "eligible" means "this is bit-identical to a stock guide". The
+feature is orthogonal to masking, which is why the mask input is optional and why
+`Apply Semantic Guides` needs neither the forward-pass fork nor the patch node.
+
+### One plan, two consumers
+
+    Empty AV Latent ──┬──────────────────────────────► KSampler
+                      ▼
+             Build Guide Spec (align → VAE → strengths)
+                  ├── Apply Semantic Guides (clip → clip)
+                  └── Add Guides from Spec (positive → positive)
+
+The split exists because Qwen runs *inside* the conditioning node: semantic
+information has to be in place before that node executes, and there is no adding
+it to an encoded `CONDITIONING` afterwards. The old all-in-one nodes still work
+and are unchanged; they now build the same spec internally.
+
+Planning once is not a tidiness argument. The canvas cover-crop, `min_coverage`,
+the run segmentation and H3's clip-length rounding each discard pixels, and a
+second implementation would have to discard exactly the same ones forever.
+`GuideChunk.aligned_frames` *is* the tensor handed to the VAE — the same object,
+not an equal one — so Qwen cannot be shown a frame the latent guide lacks, in
+particular nothing the cover-crop removed.
+
+The spec carries the target it was planned against and `Add Guides from Spec`
+refuses a mismatch. That check is the price of stating the geometry twice: the
+spec needs a latent before the conditioning node makes its own.
+
+### Merged or separate
+
+`Add Masked Guides from Video` can produce several guide clips from one source.
+`presentation` decides how they are labelled:
+
+* **separate** — one `<Video k>` per chunk. Says "here are k different videos".
+* **merged** (default) — one `<Video k>` whose timestamps jump: `<1.1 seconds>`
+  … `<5.7 seconds>`.
+
+Neither emits anything for the gap. Each vision block is encoded independently
+with `grid_t = 1` and takes a single M-RoPE time position from the running text
+counter, so the *only* representation of a hole is the jump in the digits — a gap
+costs nothing structurally. `merged` is the default because chunks from one
+masked source video are one subject observed at intervals, and `separate` asserts
+otherwise; `separate` remains useful when the prompt needs to address the chunks
+individually. Neither reproduces training exactly: core always emits 0-based
+timestamps per reference video, and conveying a target-timeline position needs
+non-zero starts in both arms. Worth an A/B.
+
+Blocks pair adjacent frames and label the pair with the **mean** of their
+timestamps, so each chunk is repeat-padded to an even sample count before
+merging. Without that, one chunk's last frame would fuse with the next chunk's
+first inside a single temporal patch, labelled with a time belonging to neither.
+
+### Two costs to know about
+
+`sample_fps` defaults to core's 2 fps, which is tuned for 2–15 second reference
+videos. H3 guide clips are 5/22/39 frames — 0.2/0.9/1.6 s — so at 2 fps a guide
+clip yields one or two samples and the clip presentation collapses into the still
+one. Raise it deliberately, and watch the second cost: at a 1344×768 canvas one
+vision block is roughly a thousand merged Qwen tokens against a prompt of a few
+dozen. Those tokens ride the text span every sampling step and dilute prompt
+attention. The node reports the estimate.
+
+### What it does not touch
+
+A semantic reference produces no `minimax_refs` entry, so it adds no reference
+block, occupies no time-axis span in `PackedLayout`, and does not move the target
+cursor. It is Qwen information and nothing else.
+
+It does still shift the guide's *absolute* rope coordinate, because the vision
+block lengthens the text span and `PackedLayout` starts its target timeline at
+`text_len`. Every row shifts by the same amount. The invariant worth asserting —
+and the one the tests assert — is the guide's offset from the target origin, not
+its absolute position; an absolute-coordinate check fails on a correct
+implementation.
+
+Items are appended *after* whatever the conditioning node presents. Reference
+labels and packed reference rows correspond by position, so a semantic item —
+which has no packed rows — inserted ahead of a native reference would
+desynchronise every reference after it. Appending also continues core's per-type
+`<Video k>` numbering rather than colliding with it.
 
 ## Running the experiments
 

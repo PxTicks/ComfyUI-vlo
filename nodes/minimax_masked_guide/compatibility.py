@@ -204,6 +204,65 @@ def _probe_keyframe_layout(module) -> None:
         raise RuntimeError(INCOMPATIBLE.format("PackedLayout does not emit one cond row per 2x2 guide patch"))
 
 
+SEMANTIC_INCOMPATIBLE = (
+    "Semantic guide conditioning presents a guide through core's own timed <Video k> "
+    "reference vocabulary. The installed MiniMax H3 text encoder does not support it: {}"
+)
+
+
+def _probe_timed_video_presentation() -> None:
+    """Prove core's tokenizer still takes ref items and honours their timestamps.
+
+    This is the whole mechanism the semantic path rides on -- `minimax_ref_items`,
+    the "<Video k>" label, and a per-block timestamp taken from the item rather
+    than assumed to be 2 fps -- so it is probed by running it rather than by
+    reading a version number. The tokenizer is built without its weights: only the
+    presentation logic is under test, and the text half is stubbed out so the probe
+    needs no tokenizer files on disk.
+    """
+    try:
+        from comfy.text_encoders.minimax import MiniMaxH3Tokenizer
+    except ImportError as exc:
+        raise RuntimeError(SEMANTIC_INCOMPATIBLE.format(
+            "comfy.text_encoders.minimax is unavailable")) from exc
+
+    class _TextOnly:
+        def tokenize_with_weights(self, text, return_word_ids=False, disable_weights=True):
+            return [[(text, 1.0)]]
+
+    tokenizer = MiniMaxH3Tokenizer.__new__(MiniMaxH3Tokenizer)
+    tokenizer.qwen3vl_32b = _TextOnly()
+    try:
+        out = tokenizer.tokenize_with_weights("prompt", minimax_ref_items=[
+            {"type": "video", "data": torch.zeros(2, 8, 8, 3), "timestamps": [2.8, 3.0]}])
+        entries = out["qwen3vl_32b"][0]
+    except Exception as exc:
+        raise RuntimeError(SEMANTIC_INCOMPATIBLE.format(
+            "MiniMaxH3Tokenizer rejects timed reference items: {}".format(exc))) from exc
+
+    texts = [token for token, *_ in entries if isinstance(token, str)]
+    vision = [token for token, *_ in entries if isinstance(token, dict)]
+    if "<Video 1>: " not in texts:
+        raise RuntimeError(SEMANTIC_INCOMPATIBLE.format(
+            "a video reference item no longer emits a <Video k> label (emitted {})".format(texts)))
+    if "<2.9 seconds>" not in texts:
+        raise RuntimeError(SEMANTIC_INCOMPATIBLE.format(
+            "block timestamps no longer come from the item's own `timestamps` (emitted {})".format(texts)))
+    if not vision or not vision[0].get("minimax_video_block"):
+        raise RuntimeError(SEMANTIC_INCOMPATIBLE.format(
+            "a video reference item no longer emits two-frame vision blocks"))
+
+
+def check_semantic_supported() -> None:
+    """Raise unless core can present a guide to Qwen as a timed video reference.
+
+    Deliberately independent of `check_core_compatible`: a full-confidence guide is
+    a stock guide, so semantic conditioning needs nothing from the forward-pass fork
+    and works on an unpatched model.
+    """
+    _probe_timed_video_presentation()
+
+
 def check_core_compatible() -> None:
     """Raise unless the installed H3 implementation matches what the fork assumes."""
     module = h3_module()

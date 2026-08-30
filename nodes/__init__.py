@@ -38,8 +38,12 @@ from .minimax import (
     vloMiniMaxH3ReferenceToVideoBatch,
 )
 from .minimax_masked_guide import (
+    vloMiniMaxH3AddGuidesFromSpec,
     vloMiniMaxH3AddMaskedGuide,
     vloMiniMaxH3AddMaskedGuidesFromVideo,
+    vloMiniMaxH3ApplySemanticGuides,
+    vloMiniMaxH3BuildGuideSpec,
+    vloMiniMaxH3BuildGuideSpecFromVideo,
     vloMiniMaxH3GuideTokenMaskPreview,
     vloMiniMaxH3MaskedGuidePixelFill,
     vloMiniMaxH3PatchMaskedGuides,
@@ -66,6 +70,10 @@ class vloExtension(ComfyExtension):
             vloMiniMaxH3ReferenceToVideoBatch,
             vloMiniMaxH3AddMaskedGuide,
             vloMiniMaxH3AddMaskedGuidesFromVideo,
+            vloMiniMaxH3BuildGuideSpec,
+            vloMiniMaxH3BuildGuideSpecFromVideo,
+            vloMiniMaxH3AddGuidesFromSpec,
+            vloMiniMaxH3ApplySemanticGuides,
             vloMiniMaxH3PatchMaskedGuides,
             vloMiniMaxH3GuideTokenMaskPreview,
             vloMiniMaxH3MaskedGuidePixelFill,

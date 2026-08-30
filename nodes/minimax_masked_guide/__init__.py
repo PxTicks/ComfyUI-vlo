@@ -8,16 +8,24 @@ lands upstream. Everything else here is ordinary node code.
 from __future__ import annotations
 
 from .nodes import (
+    vloMiniMaxH3AddGuidesFromSpec,
     vloMiniMaxH3AddMaskedGuide,
     vloMiniMaxH3AddMaskedGuidesFromVideo,
+    vloMiniMaxH3ApplySemanticGuides,
+    vloMiniMaxH3BuildGuideSpec,
+    vloMiniMaxH3BuildGuideSpecFromVideo,
     vloMiniMaxH3GuideTokenMaskPreview,
     vloMiniMaxH3MaskedGuidePixelFill,
     vloMiniMaxH3PatchMaskedGuides,
 )
 
 __all__ = [
+    "vloMiniMaxH3AddGuidesFromSpec",
     "vloMiniMaxH3AddMaskedGuide",
     "vloMiniMaxH3AddMaskedGuidesFromVideo",
+    "vloMiniMaxH3ApplySemanticGuides",
+    "vloMiniMaxH3BuildGuideSpec",
+    "vloMiniMaxH3BuildGuideSpecFromVideo",
     "vloMiniMaxH3PatchMaskedGuides",
     "vloMiniMaxH3GuideTokenMaskPreview",
     "vloMiniMaxH3MaskedGuidePixelFill",
