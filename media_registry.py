@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import time
 import uuid
-from collections.abc import Callable, Iterable, Set as AbstractSet
+from collections.abc import Callable, Iterable, Mapping, Sequence, Set as AbstractSet
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 
 # A media id is a uuid4 string. Matching on that shape keeps the walk below from
@@ -29,10 +29,10 @@ def _collect_candidate_ids(value: Any, into: set[str]) -> None:
     if _looks_like_media_id(value):
         into.add(value)
     elif isinstance(value, (list, tuple)):
-        for entry in value:
+        for entry in cast(Sequence[Any], value):
             _collect_candidate_ids(entry, into)
     elif isinstance(value, dict):
-        for entry in value.values():
+        for entry in cast(Mapping[Any, Any], value).values():
             _collect_candidate_ids(entry, into)
 
 
@@ -53,12 +53,12 @@ def collect_media_ids_from_queue(entries: Iterable[Any]) -> set[str]:
             continue
         if not isinstance(prompt, dict):
             continue
-        for node in prompt.values():
+        for node in cast(Mapping[Any, Any], prompt).values():
             if not isinstance(node, dict):
                 continue
-            inputs = node.get("inputs")
+            inputs = cast(Mapping[Any, Any], node).get("inputs")
             if isinstance(inputs, dict):
-                for value in inputs.values():
+                for value in cast(Mapping[Any, Any], inputs).values():
                     _collect_candidate_ids(value, ids)
     return ids
 
@@ -219,7 +219,7 @@ class MediaRegistry:
         now = self._now()
         media_item = MediaItem(
             media_id=str(uuid.uuid4()),
-            kind=normalized_kind,  # type: ignore[arg-type]
+            kind=normalized_kind,
             filename=filename,
             content_type=content_type,
             data=data,
