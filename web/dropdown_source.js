@@ -1,6 +1,8 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
+import { installRemoteResetGuard } from "./memory_widget_guard.mjs";
+
 const NODE_CONFIGS = {
     vloMemoryLoadImage: { kind: "image", fileWidget: "image" },
     vloMemoryLoadAudio: { kind: "audio", fileWidget: "audio" },
@@ -109,6 +111,24 @@ app.registerExtension({
             fileWidget.value = replacement;
             node.setDirtyCanvas?.(true, true);
         };
+
+        // ComfyUI resets a remote-backed combo to the first fetched option the
+        // first time the option list resolves, discarding what the workflow
+        // restored. All memory loaders of a kind share one options route, so
+        // that reset repoints every one of them at the same newest clip — a
+        // source loader and a mask loader silently end up on the same video.
+        const resetGuard = installRemoteResetGuard({
+            widget: fileWidget,
+            isFolderMode: () => Boolean(toggleWidget.value),
+            readMemoryValues,
+        });
+        if (resetGuard) {
+            const originalOnConfigure = node.onConfigure;
+            node.onConfigure = function (info) {
+                originalOnConfigure?.apply(this, arguments);
+                resetGuard.noteRestoredValue();
+            };
+        }
 
         const originalToggleCallback = toggleWidget.callback;
         toggleWidget.callback = function (value) {
