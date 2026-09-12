@@ -446,6 +446,233 @@ def _default_stream_noise_mask(stream: torch.Tensor) -> torch.Tensor:
     return torch.ones(shape, device=stream.device, dtype=stream.dtype)
 
 
+_FEATHER_CURVES = ("cosine", "linear", "smoothstep", "exponential")
+_FEATHER_MODES = ("outer", "centered", "inner")
+_EXPONENTIAL_FEATHER_DECAY = 5.0
+
+
+def _feather_weight(curve: str, position: float) -> float:
+    """Ramp weight at `position` in (0, 1), falling from the solid core to zero."""
+    if position <= 0.0:
+        return 1.0
+    if position >= 1.0:
+        return 0.0
+    if curve == "linear":
+        return 1.0 - position
+    if curve == "cosine":
+        return 0.5 * (1.0 + math.cos(math.pi * position))
+    if curve == "smoothstep":
+        return 1.0 - position * position * (3.0 - 2.0 * position)
+    if curve == "exponential":
+        tail = math.exp(-_EXPONENTIAL_FEATHER_DECAY)
+        return (math.exp(-_EXPONENTIAL_FEATHER_DECAY * position) - tail) / (1.0 - tail)
+    raise ValueError(f"Unsupported feather curve: {curve}")
+
+
+def _feather_kernel(
+    curve: str,
+    *,
+    lead_hold: int,
+    lead_ramp: int,
+    tail_hold: int,
+    tail_ramp: int,
+    max_offset: int,
+) -> dict[int, float]:
+    """Offset -> weight for one masked step. Negative offsets lead, positive trail.
+
+    A ramp of N steps yields exactly N non-zero weights, so the step beyond the
+    ramp is genuinely zero rather than the last rung of the ramp.
+
+    `max_offset` bounds which offsets are worth evaluating on a short clip; it
+    deliberately does not shorten the ramp itself, because the requested length
+    is the curve's denominator. Clamping it there would steepen the decay instead
+    of truncating it, and a ramp running off the end of the clip would come out
+    at a completely different rate from the same ramp with room to finish.
+    """
+    if curve not in _FEATHER_CURVES:
+        # Checked here rather than only where the ramp is sampled, so a bad curve
+        # is caught even when every ramp rounds to zero steps.
+        raise ValueError(f"Unsupported feather curve: {curve}")
+
+    kernel = {0: 1.0}
+    for sign, hold, ramp in ((-1, lead_hold, lead_ramp), (1, tail_hold, tail_ramp)):
+        for distance in range(1, min(hold + ramp, max_offset) + 1):
+            if distance <= hold:
+                weight = 1.0
+            else:
+                weight = _feather_weight(curve, (distance - hold) / (ramp + 1))
+            if weight > 0.0:
+                kernel[sign * distance] = weight
+    return kernel
+
+
+def _shift_along(tensor: torch.Tensor, offset: int, time_axis: int) -> torch.Tensor:
+    """tensor[..., i + offset, ...] with replicate padding at both ends.
+
+    Replicate is what keeps a region that runs to the clip edge from being
+    feathered there: the clip boundary is not a seam with preserved audio.
+    """
+    if offset == 0:
+        return tensor
+    length = tensor.shape[time_axis]
+    indices = torch.arange(length, device=tensor.device) + offset
+    return tensor.index_select(time_axis, indices.clamp_(0, length - 1))
+
+
+def _erode_mask(
+    mask: torch.Tensor,
+    *,
+    lead_steps: int,
+    tail_steps: int,
+    time_axis: int,
+) -> torch.Tensor:
+    """Pull each masked region's start in by `lead_steps` and its end by `tail_steps`."""
+    eroded = mask
+    for offset in range(1, lead_steps + 1):
+        eroded = torch.minimum(eroded, _shift_along(mask, -offset, time_axis))
+    for offset in range(1, tail_steps + 1):
+        eroded = torch.minimum(eroded, _shift_along(mask, offset, time_axis))
+    return eroded
+
+
+def _flat_dilate_mask(
+    mask: torch.Tensor,
+    *,
+    lead_steps: int,
+    tail_steps: int,
+    time_axis: int,
+) -> torch.Tensor:
+    """The dual of `_erode_mask`: push each region's start and end back out.
+
+    Eroding then flat-dilating by the same amounts is a morphological opening,
+    which restores every region wide enough to survive and leaves nothing behind
+    for the ones that were not. That difference is how a destroyed region is found.
+    """
+    dilated = mask
+    for offset in range(1, lead_steps + 1):
+        dilated = torch.maximum(dilated, _shift_along(mask, offset, time_axis))
+    for offset in range(1, tail_steps + 1):
+        dilated = torch.maximum(dilated, _shift_along(mask, -offset, time_axis))
+    return dilated
+
+
+def _dilate_mask(
+    mask: torch.Tensor,
+    kernel: dict[int, float],
+    time_axis: int,
+) -> torch.Tensor:
+    """Grayscale dilation by the ramp kernel: out[i] = max_j mask[i - j] * kernel[j].
+
+    Taking the max is what makes neighbouring regions merge instead of their
+    ramps cancelling, and it leaves the solid core untouched because kernel[0] is 1.
+    """
+    dilated = None
+    for offset, weight in kernel.items():
+        shifted = _shift_along(mask, -offset, time_axis)
+        if weight != 1.0:
+            shifted = shifted * weight
+        dilated = shifted if dilated is None else torch.maximum(dilated, shifted)
+    return dilated
+
+
+def _feather_steps(
+    seconds: float,
+    latent_rate: float | None,
+    *,
+    label: str,
+    at_least_one: bool,
+) -> int:
+    duration = _positive_float(seconds)
+    if duration is None:
+        return 0
+    if latent_rate is None:
+        raise ValueError(
+            f"{label} requires an audio latent rate. Connect the audio VAE, attach "
+            "rate metadata, or set an explicit audio latent rate."
+        )
+    steps = int(round(duration * latent_rate))
+    if at_least_one:
+        # A requested ramp shorter than one latent step still gets one, so a small
+        # value softens the seam instead of silently doing nothing.
+        return max(1, steps)
+    return steps
+
+
+def _reject_eroded_regions(
+    mask: torch.Tensor,
+    core: torch.Tensor,
+    *,
+    lead_erode: int,
+    tail_erode: int,
+    time_axis: int,
+    mode: str,
+) -> None:
+    """Fail when the erosion destroyed any masked region, not just all of them.
+
+    Checking the mask's overall peak would only catch the case where nothing at
+    all survives, so a short region alongside a long one would disappear in
+    silence and quietly shrink the edit.
+    """
+    reopened = _flat_dilate_mask(
+        core, lead_steps=lead_erode, tail_steps=tail_erode, time_axis=time_axis
+    )
+    lost = (mask > 0.0) & (reopened <= 0.0)
+    if not bool(lost.any()):
+        return
+
+    lost_steps = int(
+        lost.movedim(time_axis, 0).contiguous().flatten(1).any(dim=1).sum()
+    )
+    raise ValueError(
+        f"The '{mode}' feather of {lead_erode} + {tail_erode} latent steps is wider "
+        f"than a masked region it has to fit inside, erasing {lost_steps} masked "
+        "step(s) entirely. Shorten the ramp, or use 'outer', which never shrinks "
+        "the masked region."
+    )
+
+
+def _feather_audio_mask(
+    mask: torch.Tensor,
+    *,
+    time_axis: int,
+    mode: str,
+    kernel: dict[int, float],
+    lead_ramp: int,
+    tail_ramp: int,
+    floor: float,
+) -> torch.Tensor:
+    if mode == "outer":
+        lead_erode = tail_erode = 0
+    elif mode == "centered":
+        lead_erode, tail_erode = lead_ramp // 2, tail_ramp // 2
+    elif mode == "inner":
+        lead_erode, tail_erode = lead_ramp, tail_ramp
+    else:
+        raise ValueError(f"Unsupported feather mode: {mode}")
+
+    # Shifting further than the clip only repeats the edge step, so bounding the
+    # erosion loops here costs nothing and changes no result.
+    length = int(mask.shape[time_axis])
+    lead_erode, tail_erode = min(lead_erode, length), min(tail_erode, length)
+
+    core = _erode_mask(
+        mask, lead_steps=lead_erode, tail_steps=tail_erode, time_axis=time_axis
+    )
+    if lead_erode or tail_erode:
+        _reject_eroded_regions(
+            mask,
+            core,
+            lead_erode=lead_erode,
+            tail_erode=tail_erode,
+            time_axis=time_axis,
+            mode=mode,
+        )
+    feathered = _dilate_mask(core, kernel, time_axis)
+    if floor > 0.0:
+        feathered = feathered.clamp(min=floor)
+    return feathered.clamp(0.0, 1.0)
+
+
 class LTXSetAudioLatentBinaryMasks(io.ComfyNode):
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -740,4 +967,309 @@ class vloSetAudioLatentBinaryMasks(io.ComfyNode):
         if stream_index is not None:
             resolved_metadata["audio_stream_index"] = stream_index
         output["audio_latent_metadata"] = resolved_metadata
+        return io.NodeOutput(output)
+
+
+def _restore_audio_under_ramp(
+    audio_samples: torch.Tensor,
+    feathered: torch.Tensor,
+    original_audio_latent,
+    audio_vae,
+) -> torch.Tensor | None:
+    """Put the pre-composite audio back wherever the feather left a partial step.
+
+    A blank latent composite clears the samples under the binary mask, which is
+    harmless while the mask is binary: a fully generated step never reads its
+    latent image. A ramp does read it, weighted by 1 - mask, so any ramp step
+    lying inside the cleared region would blend toward silence. Outer ramps fall
+    outside that region and need nothing; inner and centered ramps sit within it.
+    """
+    if original_audio_latent is None:
+        return None
+
+    ramp = (feathered > 0.0) & (feathered < 1.0)
+    if not bool(ramp.any()):
+        return None
+
+    original_samples, _, _ = _resolve_audio_stream(
+        original_audio_latent, original_audio_latent["samples"], audio_vae
+    )
+    if tuple(original_samples.shape) != tuple(audio_samples.shape):
+        raise ValueError(
+            "original_audio_latent's audio stream is shaped "
+            f"{tuple(original_samples.shape)}, but this latent's is "
+            f"{tuple(audio_samples.shape)}. It must be the same latent, from "
+            "before the composite."
+        )
+
+    restored = audio_samples.clone()
+    restored[ramp] = original_samples.to(
+        device=audio_samples.device, dtype=audio_samples.dtype
+    )[ramp]
+    return restored
+
+
+class vloFeatherAudioLatentMask(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="vloFeatherAudioLatentMask",
+            search_aliases=[
+                "feather audio mask",
+                "audio mask crossfade",
+                "audio mask tail",
+                "soften audio latent mask",
+            ],
+            display_name="vlo Feather Audio Latent Mask",
+            category="latent/audio",
+            description=(
+                "Softens the time edges of an audio latent noise mask so inpainted "
+                "audio joins the surrounding audio without a click. A fractional mask "
+                "value is a genuine per-step denoise strength, not just a crossfade: "
+                "MiniMax H3 places those rows at sigma = mask * sigma_audio and "
+                "conditions them accordingly, so the model generates the transition. "
+                "Run this after any blank latent composite, which leaves outer ramps "
+                "with the original audio to blend toward. Inner and centered ramps sit "
+                "inside the region that composite cleared, so those need "
+                "original_audio_latent connected as well."
+            ),
+            inputs=[
+                io.Latent.Input(
+                    "audio_latent",
+                    tooltip=(
+                        "Standalone audio latent or nested AV latent that already "
+                        "carries an audio noise mask. Nested video masks are preserved."
+                    ),
+                ),
+                io.Combo.Input(
+                    "mode",
+                    options=list(_FEATHER_MODES),
+                    default="outer",
+                    tooltip=(
+                        "Where the ramp sits relative to the masked region. 'outer' "
+                        "keeps the region solid and decays outward into the preserved "
+                        "audio, 'centered' straddles the edge, and 'inner' keeps the "
+                        "ramp inside so no preserved step is touched. The latter two "
+                        "shrink the region, so a region narrower than the ramp loses "
+                        "steps to it."
+                    ),
+                ),
+                io.Float.Input(
+                    "lead_ramp",
+                    default=0.08,
+                    min=0.0,
+                    max=10.0,
+                    step=0.01,
+                    tooltip=(
+                        "Seconds of ramp before each masked region. Rounded to whole "
+                        "audio latent steps (25 ms for MiniMax, 40 ms for LTX); a "
+                        "non-zero value always gets at least one step."
+                    ),
+                ),
+                io.Float.Input(
+                    "tail_ramp",
+                    default=0.12,
+                    min=0.0,
+                    max=10.0,
+                    step=0.01,
+                    tooltip=(
+                        "Seconds of ramp after each masked region. Usually longer than "
+                        "the lead, because a note or phoneme decays for longer than it "
+                        "takes to start."
+                    ),
+                ),
+                io.Float.Input(
+                    "lead_hold",
+                    default=0.0,
+                    min=0.0,
+                    max=10.0,
+                    step=0.01,
+                    tooltip=(
+                        "Seconds of fully solid mask added before each region, ahead of "
+                        "the ramp. Audible onsets lead the visible motion that drew the "
+                        "mask, so a hold hands those steps to the model outright."
+                    ),
+                ),
+                io.Float.Input(
+                    "tail_hold",
+                    default=0.0,
+                    min=0.0,
+                    max=10.0,
+                    step=0.01,
+                    tooltip=(
+                        "Seconds of fully solid mask added after each region, ahead of "
+                        "the ramp. Useful when reverb or a decay tail outlasts the "
+                        "masked frames."
+                    ),
+                ),
+                io.Combo.Input(
+                    "curve",
+                    options=list(_FEATHER_CURVES),
+                    default="cosine",
+                    tooltip=(
+                        "Ramp shape. 'cosine' and 'smoothstep' flatten at both ends, so "
+                        "there is no kink where the ramp meets the solid core; 'linear' "
+                        "and 'exponential' leave one."
+                    ),
+                ),
+                io.Float.Input(
+                    "floor",
+                    default=0.0,
+                    min=0.0,
+                    max=1.0,
+                    step=0.01,
+                    advanced=True,
+                    tooltip=(
+                        "Minimum mask value everywhere, applied after the ramp. Above "
+                        "zero this lightly denoises the whole preserved region, which "
+                        "can even out a level or timbre step but rewrites audio you "
+                        "asked to keep. Zero leaves preserved audio untouched."
+                    ),
+                ),
+                io.Latent.Input(
+                    "original_audio_latent",
+                    optional=True,
+                    tooltip=(
+                        "The same latent from before any blank latent composite. Its "
+                        "audio is restored underneath the ramp, so ramp steps blend "
+                        "toward the original audio instead of toward silence. Required "
+                        "for 'inner' and 'centered' after a composite, since those "
+                        "ramps sit inside the region it cleared; 'outer' ramps fall "
+                        "outside it and need nothing."
+                    ),
+                ),
+                io.Vae.Input(
+                    "audio_vae",
+                    optional=True,
+                    advanced=True,
+                    tooltip=(
+                        "Audio VAE used to resolve layout and latent rate automatically. "
+                        "It may be omitted when the latent carries metadata or overrides "
+                        "are supplied."
+                    ),
+                ),
+                io.Combo.Input(
+                    "layout_override",
+                    options=["auto", "ltx", "minimax"],
+                    default="auto",
+                    advanced=True,
+                    tooltip=(
+                        "Auto prefers latent/VAE metadata, then recognizes current LTX "
+                        "[B,C,T,F] and MiniMax [B,C,S,T] VAEs."
+                    ),
+                ),
+                io.Float.Input(
+                    "audio_latent_rate",
+                    default=0.0,
+                    min=0.0,
+                    max=1000.0,
+                    step=0.01,
+                    advanced=True,
+                    tooltip=(
+                        "Audio latent steps per second, used to convert the ramp and "
+                        "hold seconds. Zero resolves this from metadata or the VAE."
+                    ),
+                ),
+            ],
+            outputs=[io.Latent.Output(display_name="audio_latent")],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        audio_latent,
+        mode="outer",
+        lead_ramp=0.08,
+        tail_ramp=0.12,
+        lead_hold=0.0,
+        tail_hold=0.0,
+        curve="cosine",
+        floor=0.0,
+        original_audio_latent=None,
+        audio_vae=None,
+        layout_override="auto",
+        audio_latent_rate=0.0,
+    ) -> io.NodeOutput:
+        samples = audio_latent["samples"]
+        audio_samples, stream_index, streams = _resolve_audio_stream(
+            audio_latent, samples, audio_vae
+        )
+        time_axis, architecture = _resolve_audio_time_axis(
+            audio_latent, audio_vae, audio_samples, layout_override
+        )
+        latent_rate = _resolve_audio_latent_rate(
+            audio_latent,
+            audio_vae,
+            rate_override=audio_latent_rate,
+            architecture=architecture,
+        )
+
+        existing_noise_mask = audio_latent.get("noise_mask")
+        if streams is None:
+            existing_masks = None
+            audio_mask = existing_noise_mask
+        else:
+            existing_masks = _nested_existing_masks(existing_noise_mask, len(streams))
+            audio_mask = existing_masks[stream_index]
+
+        mask = _expand_existing_mask(audio_mask, audio_samples)
+        if mask is None:
+            raise ValueError(
+                "The audio latent has no audio noise mask to feather. Set one first "
+                "(for example with vlo Set Audio Latent Binary Masks)."
+            )
+
+        length = int(audio_samples.shape[time_axis])
+        steps = {
+            "lead_ramp": (lead_ramp, True),
+            "tail_ramp": (tail_ramp, True),
+            "lead_hold": (lead_hold, False),
+            "tail_hold": (tail_hold, False),
+        }
+        # Kept at the requested length rather than clipped to the clip: the ramp
+        # length is the curve's denominator, so clipping would change its rate.
+        resolved = {
+            name: _feather_steps(
+                seconds, latent_rate, label=name, at_least_one=at_least_one
+            )
+            for name, (seconds, at_least_one) in steps.items()
+        }
+
+        kernel = _feather_kernel(
+            curve,
+            lead_hold=resolved["lead_hold"],
+            lead_ramp=resolved["lead_ramp"],
+            tail_hold=resolved["tail_hold"],
+            tail_ramp=resolved["tail_ramp"],
+            max_offset=max(0, length - 1),
+        )
+        feathered = _feather_audio_mask(
+            mask.to(torch.float32),
+            time_axis=time_axis,
+            mode=mode,
+            kernel=kernel,
+            lead_ramp=resolved["lead_ramp"],
+            tail_ramp=resolved["tail_ramp"],
+            floor=float(floor),
+        ).to(dtype=audio_samples.dtype)
+
+        restored = _restore_audio_under_ramp(
+            audio_samples, feathered, original_audio_latent, audio_vae
+        )
+
+        output = audio_latent.copy()
+        if streams is None:
+            output["noise_mask"] = feathered
+            if restored is not None:
+                output["samples"] = restored
+        else:
+            existing_masks[stream_index] = feathered
+            for index, stream in enumerate(streams):
+                if existing_masks[index] is None:
+                    existing_masks[index] = _default_stream_noise_mask(stream)
+            output["noise_mask"] = comfy.nested_tensor.NestedTensor(existing_masks)
+            if restored is not None:
+                rebuilt = list(streams)
+                rebuilt[stream_index] = restored
+                output["samples"] = comfy.nested_tensor.NestedTensor(rebuilt)
         return io.NodeOutput(output)

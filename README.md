@@ -110,6 +110,43 @@ and is tied to the ComfyUI version it was forked from. See
 [nodes/minimax_masked_guide/README.md](nodes/minimax_masked_guide/README.md) for
 the semantics, the compatibility rules and the experiment protocol.
 
+## Audio latent masks
+
+`vlo Set Audio Latent Binary Masks` turns a mask video into a temporal noise mask
+on an audio latent, so an inpaint regenerates audio over exactly the masked
+frames. The mask it produces is binary by design: it flips between preserved and
+generated in a single audio latent step (25 ms for MiniMax H3, 40 ms for LTX).
+
+That hard edge is audible. Generated audio meets the surrounding audio with no
+shared phase and no shared level, which reads as a click or a skip at the seam.
+
+`vlo Feather Audio Latent Mask` softens those time edges. A fractional mask value
+is not a crossfade after the fact — comfy/ldm/minimax/model.py puts a masked
+audio row at `sigma = mask * sigma_audio` and conditions it at that timestep, so
+a decaying mask is a genuine per-step denoise strength and the model generates
+the transition itself.
+
+The default `outer` mode keeps the masked region fully solid and decays outward
+into the preserved audio, so nothing you asked to regenerate loses authority.
+`centered` straddles the original edge and `inner` keeps the whole ramp inside
+the region. Ramp and hold lengths are given in seconds and converted using the
+VAE's audio latent rate. The holds are worth reaching for when the audible event
+outruns the frames that were masked — an onset leads visible mouth motion, and
+reverb outlasts it.
+
+**Place it after any blank latent composite.** `vlo Latent Composite Masked`
+clears the destination wherever the mask is set. That is harmless while the mask
+is binary, because a fully generated step never reads its latent image, but a
+ramp step does read it, weighted by `1 - mask`. Feather before the composite and
+the ramp is cleared along with the core; feather after it and outer ramps land
+outside the cleared region, on the original audio, which is what they need.
+
+**Inner and centered ramps need `original_audio_latent`.** Those modes put the
+ramp *inside* the binary region, which is exactly the part the composite cleared,
+so ordering alone cannot save them and they would blend toward silence. Connect
+the pre-composite latent to `original_audio_latent` and the node restores the
+original audio underneath the ramp. Outer ramps never need it.
+
 ## Installation
 
 Clone (or symlink) this repository into your ComfyUI `custom_nodes` directory and

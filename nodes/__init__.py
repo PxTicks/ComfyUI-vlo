@@ -17,7 +17,11 @@ import comfy.utils  # noqa: F401
 from comfy_api.latest import ComfyExtension, Input, InputImpl, Types, io  # noqa: F401
 
 from . import routes  # noqa: F401  (registers the /api/vlo-memory endpoints)
-from .audio_masks import LTXSetAudioLatentBinaryMasks, vloSetAudioLatentBinaryMasks
+from .audio_masks import (
+    LTXSetAudioLatentBinaryMasks,
+    vloFeatherAudioLatentMask,
+    vloSetAudioLatentBinaryMasks,
+)
 from .latent_masks import (
     _vae_encode_spatial_crop,
     _vae_temporal_groups,
@@ -82,6 +86,7 @@ class vloExtension(ComfyExtension):
             vloSaveVideoWebsocket,
             LTXSetAudioLatentBinaryMasks,
             vloSetAudioLatentBinaryMasks,
+            vloFeatherAudioLatentMask,
             vloLatentCompositeMasked,
             vloMaskToLatentMask,
             vloGateNone,
