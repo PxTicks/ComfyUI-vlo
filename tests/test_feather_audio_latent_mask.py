@@ -34,17 +34,22 @@ def _timeline(output) -> list[float]:
 def _feather(**kwargs):
     node = kwargs.pop("nodes_module").vloFeatherAudioLatentMask
     kwargs.setdefault("audio_vae", _VAEWrapper(_MiniMaxAudioVAE()))
+    # These cases pin ramp geometry step by step, so they start from no hold at
+    # all and opt in where the hold itself is what is under test. The packaged
+    # default is non-zero and would shift every timeline below.
+    kwargs.setdefault("lead_hold", 0.0)
+    kwargs.setdefault("tail_hold", 0.0)
     return node.execute(**kwargs).result[0]
 
 
-def test_schema_defaults_to_an_asymmetric_outer_feather(nodes_module) -> None:
+def test_schema_defaults_to_a_held_outer_feather(nodes_module) -> None:
     schema = nodes_module.vloFeatherAudioLatentMask.GET_SCHEMA()
     inputs = {input_spec.id: input_spec.as_dict() for input_spec in schema.inputs}
 
     assert inputs["mode"]["default"] == "outer"
     assert inputs["curve"]["default"] == "cosine"
-    assert inputs["tail_ramp"]["default"] > inputs["lead_ramp"]["default"] > 0.0
-    assert inputs["lead_hold"]["default"] == inputs["tail_hold"]["default"] == 0.0
+    assert inputs["lead_ramp"]["default"] == inputs["tail_ramp"]["default"] == 0.15
+    assert inputs["lead_hold"]["default"] == inputs["tail_hold"]["default"] == 0.1
     assert inputs["floor"]["default"] == 0.0
     assert inputs["audio_vae"]["optional"] is True
 

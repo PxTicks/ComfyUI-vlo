@@ -1056,7 +1056,7 @@ class vloFeatherAudioLatentMask(io.ComfyNode):
                 ),
                 io.Float.Input(
                     "lead_ramp",
-                    default=0.08,
+                    default=0.15,
                     min=0.0,
                     max=10.0,
                     step=0.01,
@@ -1068,19 +1068,19 @@ class vloFeatherAudioLatentMask(io.ComfyNode):
                 ),
                 io.Float.Input(
                     "tail_ramp",
-                    default=0.12,
+                    default=0.15,
                     min=0.0,
                     max=10.0,
                     step=0.01,
                     tooltip=(
-                        "Seconds of ramp after each masked region. Usually longer than "
-                        "the lead, because a note or phoneme decays for longer than it "
+                        "Seconds of ramp after each masked region. Worth lengthening "
+                        "past the lead when a note or phoneme decays for longer than it "
                         "takes to start."
                     ),
                 ),
                 io.Float.Input(
                     "lead_hold",
-                    default=0.0,
+                    default=0.1,
                     min=0.0,
                     max=10.0,
                     step=0.01,
@@ -1092,7 +1092,7 @@ class vloFeatherAudioLatentMask(io.ComfyNode):
                 ),
                 io.Float.Input(
                     "tail_hold",
-                    default=0.0,
+                    default=0.1,
                     min=0.0,
                     max=10.0,
                     step=0.01,
@@ -1179,10 +1179,10 @@ class vloFeatherAudioLatentMask(io.ComfyNode):
         cls,
         audio_latent,
         mode="outer",
-        lead_ramp=0.08,
-        tail_ramp=0.12,
-        lead_hold=0.0,
-        tail_hold=0.0,
+        lead_ramp=0.15,
+        tail_ramp=0.15,
+        lead_hold=0.1,
+        tail_hold=0.1,
         curve="cosine",
         floor=0.0,
         original_audio_latent=None,

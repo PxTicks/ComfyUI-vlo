@@ -118,6 +118,10 @@ def test_feather_after_the_composite_keeps_audio_under_the_ramp(nodes_module):
         audio_vae=_MiniMaxAudioVae(),
         lead_ramp=0.08,
         tail_ramp=0.12,
+        # No hold anywhere in this file: a hold widens the solid core past the
+        # binary region, which is the thing these tests compare against.
+        lead_hold=0.0,
+        tail_hold=0.0,
     ).result[0]
 
     binary_audio_mask = masked["noise_mask"].unbind()[1]
@@ -174,6 +178,8 @@ def test_feathered_mask_reaches_the_model_as_distinct_row_timesteps(nodes_module
         audio_vae=_MiniMaxAudioVae(),
         lead_ramp=0.1,
         tail_ramp=0.1,
+        lead_hold=0.0,
+        tail_hold=0.0,
         curve="linear",
     ).result[0]
 
@@ -236,6 +242,8 @@ def test_every_mode_blends_toward_real_audio_when_the_original_is_supplied(mode)
         audio_vae=_MiniMaxAudioVae(),
         lead_ramp=0.1,
         tail_ramp=0.1,
+        lead_hold=0.0,
+        tail_hold=0.0,
         curve="linear",
         mode=mode,
     ).result[0]
@@ -261,6 +269,8 @@ def test_inner_ramps_blend_toward_silence_without_the_original(mode):
         audio_vae=_MiniMaxAudioVae(),
         lead_ramp=0.1,
         tail_ramp=0.1,
+        lead_hold=0.0,
+        tail_hold=0.0,
         curve="linear",
         mode=mode,
     ).result[0]
@@ -282,6 +292,8 @@ def test_outer_ramps_need_no_original_latent():
         audio_vae=_MiniMaxAudioVae(),
         lead_ramp=0.1,
         tail_ramp=0.1,
+        lead_hold=0.0,
+        tail_hold=0.0,
         mode="outer",
     ).result[0]
 
@@ -303,5 +315,8 @@ def test_a_mismatched_original_latent_is_rejected():
             original_audio_latent=wrong,
             audio_vae=_MiniMaxAudioVae(),
             lead_ramp=0.1,
+            tail_ramp=0.0,
+            lead_hold=0.0,
+            tail_hold=0.0,
             mode="inner",
         )
