@@ -54,6 +54,7 @@ from .minimax_masked_guide import (
 )
 from .registry import REGISTRY
 from .ttm import vloTimeToMove
+from .video_save import vloSaveVideo
 from .video_nodes import (
     vloSaveImageWebsocketBMP,
     vloSaveVideoWebsocket,
@@ -84,6 +85,7 @@ class vloExtension(ComfyExtension):
             vloVideoConvertFps,
             vloSaveImageWebsocketBMP,
             vloSaveVideoWebsocket,
+            vloSaveVideo,
             LTXSetAudioLatentBinaryMasks,
             vloSetAudioLatentBinaryMasks,
             vloFeatherAudioLatentMask,

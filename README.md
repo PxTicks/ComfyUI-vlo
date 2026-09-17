@@ -147,6 +147,25 @@ so ordering alone cannot save them and they would blend toward silence. Connect
 the pre-composite latent to `original_audio_latent` and the node restores the
 original audio underneath the ramp. Outer ramps never need it.
 
+## Resized video saving
+
+`vlo Save Video` encodes an `IMAGE` batch straight to MP4, MKV or
+WebM, resizing each frame as it is encoded. It takes the same inputs as
+ComfyUI's Create Video + Save Video (fps, audio, bit depth, color space,
+container, codec, crf), plus `width`/`height`, `upscale_method` (default
+`bicubic`) and `crop`. These follow the Upscale Image node: 0 keeps that side
+proportional, and 0x0 keeps the source size.
+
+The encode loop matches native `VideoFromComponents.save_to`. FFmpeg's swscale
+resizes each frame while it converts RGB to YUV, so no resized batch is ever
+held in memory. Resized frames retain 16-bit RGB precision until that conversion;
+with no resize, the output is identical to native Save Video.
+
+`save_output` works like VideoHelperSuite's Video Combine. On, the file goes to
+the output folder. Off, it goes to ComfyUI's temp folder and still previews in
+the node. Output dimensions must be even; a side derived from the aspect ratio
+is rounded to even for you.
+
 ## Installation
 
 Clone (or symlink) this repository into your ComfyUI `custom_nodes` directory and
