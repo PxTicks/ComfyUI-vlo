@@ -1,0 +1,8 @@
+# Development-only files kept out of the registry archive.
+tests/
+.pytest_cache/
+.github/
+publish-public.sh
+commit-public.sh
+.public-exclude
+assets/

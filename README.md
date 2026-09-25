@@ -168,7 +168,14 @@ is rounded to even for you.
 
 ## Installation
 
-Clone (or symlink) this repository into your ComfyUI `custom_nodes` directory and
+Install from the [Comfy Registry](https://registry.comfy.org/nodes/comfyui-vlo)
+with ComfyUI-Manager (search for "vlo"), or with comfy-cli:
+
+```bash
+comfy node install comfyui-vlo
+```
+
+To install manually, clone (or symlink) this repository into your ComfyUI `custom_nodes` directory and
 restart ComfyUI:
 
 ```bash

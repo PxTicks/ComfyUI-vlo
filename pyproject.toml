@@ -1,0 +1,23 @@
+[project]
+name = "comfyui-vlo"
+description = "Companion nodes for the vlo video editor: in-memory media loaders, ordered batch loaders, MiniMax H3 reference and masked-guide adapters, audio latent masks and resized video saving."
+version = "0.1.0"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+# Everything the pack imports (torch, numpy, PIL, av, aiohttp) ships with ComfyUI.
+dependencies = []
+classifiers = [
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Repository = "https://github.com/PxTicks/ComfyUI-vlo"
+Documentation = "https://github.com/PxTicks/ComfyUI-vlo#readme"
+"Bug Tracker" = "https://github.com/PxTicks/ComfyUI-vlo/issues"
+
+[tool.comfy]
+PublisherId = "pxticks"
+DisplayName = "vlo"
+Icon = "https://raw.githubusercontent.com/PxTicks/ComfyUI-vlo/main/assets/icon.png"
+# comfy_extras.nodes_minimax_h3 (the MiniMax H3 adapters) first ships in 0.30.0.
+requires-comfyui = ">=0.30.0"
