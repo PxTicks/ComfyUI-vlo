@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-vlo"
-description = "Companion nodes for the vlo video editor: in-memory media loaders, ordered batch loaders, MiniMax H3 reference and masked-guide adapters, audio latent masks and resized video saving."
-version = "0.1.0"
+description = "Companion nodes for the vlo video editor: in-memory media loaders, ordered batch loaders with a list fan-out, MiniMax H3 reference and masked-guide adapters, audio latent masks and resized video saving."
+version = "0.2.0"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 # Everything the pack imports (torch, numpy, PIL, av, aiohttp) ships with ComfyUI.
