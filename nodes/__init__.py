@@ -36,7 +36,7 @@ from .loaders import (
     vloMemoryLoadVideo,
     vloMemoryLoadVideoBatch,
 )
-from .logic_nodes import vloGateNone, vloLogicNot
+from .logic_nodes import vloGateNone, vloListFanOut, vloLogicNot
 from .minimax import (
     _get_native_minimax_h3_reference_contract,
     vloMiniMaxH3ReferenceToVideoBatch,
@@ -92,6 +92,7 @@ class vloExtension(ComfyExtension):
             vloLatentCompositeMasked,
             vloMaskToLatentMask,
             vloGateNone,
+            vloListFanOut,
             vloLogicNot,
             vloTimeToMove,
         ]
