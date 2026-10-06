@@ -25,6 +25,7 @@ from .audio_masks import (
 from .latent_masks import (
     _vae_encode_spatial_crop,
     _vae_temporal_groups,
+    vloFeatherVideoLatentMask,
     vloLatentCompositeMasked,
     vloMaskToLatentMask,
 )
@@ -91,6 +92,7 @@ class vloExtension(ComfyExtension):
             vloFeatherAudioLatentMask,
             vloLatentCompositeMasked,
             vloMaskToLatentMask,
+            vloFeatherVideoLatentMask,
             vloGateNone,
             vloListFanOut,
             vloLogicNot,

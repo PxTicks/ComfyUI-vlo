@@ -11,7 +11,18 @@ import comfy.nested_tensor
 import comfy.utils
 from comfy_api.latest import io
 
-from .mask_utils import _normalize_mask_frames
+from .mask_utils import (
+    _default_stream_noise_mask,
+    _nested_existing_masks,
+    _normalize_mask_frames,
+)
+from .temporal_feather import (
+    _FEATHER_CURVES,
+    _FEATHER_MODES,
+    _feather_weight,
+    _flat_dilate_mask,
+    _shift_along,
+)
 
 
 _MASK_POOLING_METHODS = {
@@ -22,22 +33,28 @@ _MASK_POOLING_METHODS = {
 _MASK_SPATIAL_RESIZE_MODES = ("bilinear", "nearest-exact", "area", "bicubic")
 
 
-def _latent_video_stream(samples: Any) -> torch.Tensor:
-    """The stream a video mask applies to, unwrapping joint AV latents.
+def _video_stream_index(streams: list[Any]) -> int:
+    """Index of the video stream among a latent's streams.
 
     Joint latents (EmptyMiniMaxH3LatentAV, LTXVConcatAVLatent) carry a
     NestedTensor of (video, audio) rather than a plain tensor. A video mask
     describes the video stream, and the sampler fills any stream the mask does
     not cover with ones, so the audio stream is simply generated as usual.
     """
+    for index, stream in enumerate(streams):
+        if isinstance(stream, torch.Tensor) and stream.ndim == 5:
+            return index
+    raise ValueError(
+        "This joint latent has no video stream to mask. Masks describe video, "
+        "so use an audio mask node for the audio stream."
+    )
+
+
+def _latent_video_stream(samples: Any) -> torch.Tensor:
+    """The stream a video mask applies to, unwrapping joint AV latents."""
     if getattr(samples, "is_nested", False):
-        for stream in samples.unbind():
-            if isinstance(stream, torch.Tensor) and stream.ndim == 5:
-                return stream
-        raise ValueError(
-            "This joint latent has no video stream to mask. Masks describe video, "
-            "so use an audio mask node for the audio stream."
-        )
+        streams = list(samples.unbind())
+        return streams[_video_stream_index(streams)]
     return samples
 
 
@@ -520,3 +537,386 @@ class vloMaskToLatentMask(io.ComfyNode):
         #    noise_mask unclamped, so out-of-range values extrapolate instead.
         frames = frames.clamp(0.0, 1.0)
         return io.NodeOutput(frames.contiguous())
+
+
+def _inside_ramp_frames(mode: str, ramp: int) -> int:
+    """How many of a ramp's frames fall inside the masked run.
+
+    The split matches the audio feather's erosion, so a mode means the same
+    thing on both streams.
+    """
+    if mode == "outer":
+        return 0
+    if mode == "centered":
+        return ramp // 2
+    if mode == "inner":
+        return ramp
+    raise ValueError(f"Unsupported feather mode: {mode}")
+
+
+def _run_depths(covered: torch.Tensor, *, cap: int, reverse: bool) -> torch.Tensor:
+    """Per pixel, how far each frame sits into its covered run.
+
+    Counted from the run's start, or from its end when `reverse` is set, with
+    the edge frame at depth 1 and empty frames at 0. A run that reaches the clip
+    edge starts at `cap` there, because the clip boundary is not a seam with
+    preserved footage. Depths saturate at `cap`, past which the weight is 1.
+    """
+    depths = torch.zeros(covered.shape, dtype=torch.long, device=covered.device)
+    depth = torch.full(covered.shape[1:], cap, dtype=torch.long, device=covered.device)
+    frame_order = range(covered.shape[0] - 1, -1, -1) if reverse else range(covered.shape[0])
+    for index in frame_order:
+        depth = torch.where(covered[index], (depth + 1).clamp(max=cap), 0)
+        depths[index] = depth
+    return depths
+
+
+def _inside_ramp_weights(
+    depths: torch.Tensor,
+    *,
+    inside: int,
+    ramp: int,
+    curve: str,
+) -> torch.Tensor:
+    """Ramp weight for each covered frame from its depth into the run.
+
+    Depth d weighs what the audio feather gives the same frame after eroding
+    the run by `inside` and ramping back out, so the two agree whenever that
+    erosion leaves a core. Every weight is positive, so no covered frame is lost.
+    """
+    table = [1.0]
+    table += [
+        _feather_weight(curve, (inside - depth + 1) / (ramp + 1))
+        for depth in range(1, inside + 1)
+    ]
+    table.append(1.0)
+    lookup = torch.tensor(table, dtype=torch.float32, device=depths.device)
+    return lookup[depths.clamp(max=inside + 1)]
+
+
+def _feather_video_mask(
+    frames: torch.Tensor,
+    *,
+    mode: str,
+    curve: str,
+    lead_ramp: int,
+    tail_ramp: int,
+    lead_hold: int,
+    tail_hold: int,
+    floor: float,
+) -> torch.Tensor:
+    """Feather a time-first mask [T, ...] along time, independently per pixel.
+
+    Working per pixel lets each region of the mask fade on its own schedule:
+    one region can stop while another carries on, and only the one that stops
+    gets a ramp.
+    """
+    if curve not in _FEATHER_CURVES:
+        # Checked up front so a bad curve fails even when every ramp is zero.
+        raise ValueError(f"Unsupported feather curve: {curve}")
+
+    length = int(frames.shape[0])
+    lead_inside = _inside_ramp_frames(mode, lead_ramp)
+    tail_inside = _inside_ramp_frames(mode, tail_ramp)
+
+    # 1. Holds widen every run with solid mask before any ramp begins.
+    held = _flat_dilate_mask(
+        frames,
+        lead_steps=min(lead_hold, length),
+        tail_steps=min(tail_hold, length),
+        time_axis=0,
+    )
+
+    # 2. Inside a run, weigh each frame by its distance from the run's edge. The
+    #    audio feather erodes the run instead and fails when a run disappears;
+    #    per pixel, that would fail on nearly every moving mask, whose edge
+    #    pixels are covered for only a frame or two. Weighting by depth agrees
+    #    with the erosion wherever the erosion succeeds, and a run shorter than
+    #    the ramp merely peaks lower.
+    feathered = held
+    if lead_inside or tail_inside:
+        covered = held > 0.0
+        weights = torch.ones_like(held)
+        for inside, ramp, reverse in (
+            (lead_inside, lead_ramp, False),
+            (tail_inside, tail_ramp, True),
+        ):
+            if inside:
+                depths = _run_depths(covered, cap=inside + 1, reverse=reverse)
+                weights = torch.minimum(
+                    weights,
+                    _inside_ramp_weights(
+                        depths, inside=inside, ramp=ramp, curve=curve
+                    ).to(weights.dtype),
+                )
+        feathered = held * weights
+
+    # 3. Outside a run, a frame borrows the nearest covered frame's mask at the
+    #    rest of the ramp's weight, so the spatial shape carries into the fade.
+    #    Taking the max lets neighbouring runs merge instead of cancelling. The
+    #    requested ramp stays the curve's denominator even when the clip is
+    #    shorter, so a ramp running off the end keeps its rate.
+    for sign, inside, ramp in ((1, lead_inside, lead_ramp), (-1, tail_inside, tail_ramp)):
+        for distance in range(1, min(ramp - inside, length - 1) + 1):
+            weight = _feather_weight(curve, (inside + distance) / (ramp + 1))
+            if weight > 0.0:
+                feathered = torch.maximum(
+                    feathered, _shift_along(held, sign * distance, 0) * weight
+                )
+
+    if floor > 0.0:
+        feathered = feathered.clamp(min=floor)
+    return feathered.clamp(0.0, 1.0)
+
+
+def _video_mask_frames(
+    mask: torch.Tensor,
+    latent_frames: int,
+) -> tuple[torch.Tensor, Any]:
+    """A time-first view of a video noise mask, plus how to restore its layout.
+
+    comfy.utils.reshape_mask reads a 5-D mask as [B, C, T, H, W] and folds every
+    leading axis of anything smaller into time. SetLatentNoiseMask stores
+    [T, 1, H, W], so both layouts reach the feather here.
+    """
+    if mask.ndim == 5:
+        frames = mask.movedim(2, 0)
+        restore = lambda feathered: feathered.movedim(0, 2)  # noqa: E731
+    elif mask.ndim >= 2:
+        frames = mask.reshape(-1, *mask.shape[-2:])
+        restore = lambda feathered: feathered.reshape(mask.shape)  # noqa: E731
+    else:
+        raise ValueError(f"Unsupported video noise mask shape {tuple(mask.shape)}.")
+
+    # A single frame is broadcast across the whole clip, so it has no time edges
+    # but still takes the floor.
+    if frames.shape[0] not in (1, latent_frames):
+        raise ValueError(
+            f"The video noise mask has {frames.shape[0]} frame(s) but the latent "
+            f"has {latent_frames}. Ramps are counted in latent frames, so the mask "
+            "must already match the latent: build it with vlo Mask to Latent Mask."
+        )
+    return frames, restore
+
+
+def _restore_video_under_ramp(
+    video_samples: torch.Tensor,
+    feathered: torch.Tensor,
+    original_latent,
+) -> torch.Tensor | None:
+    """Put the pre-composite video back wherever the mask is partial.
+
+    A blank latent composite clears the samples under the binary mask, which a
+    fully generated token never reads. A partial token does read its latent,
+    weighted by 1 - mask, so an inner or centered ramp inside the cleared region
+    would blend toward a blank latent instead of the footage.
+    """
+    if original_latent is None:
+        return None
+
+    full_mask = comfy.utils.reshape_mask(
+        feathered.to(device=video_samples.device, dtype=torch.float32),
+        video_samples.shape,
+    )
+    partial = (full_mask > 0.0) & (full_mask < 1.0)
+    if not bool(partial.any()):
+        return None
+
+    original_streams, _ = _latent_streams(original_latent["samples"])
+    original = original_streams[_video_stream_index(original_streams)]
+    if tuple(original.shape) != tuple(video_samples.shape):
+        raise ValueError(
+            f"original_latent's video stream is shaped {tuple(original.shape)}, "
+            f"but this latent's is {tuple(video_samples.shape)}. It must be the "
+            "same latent, from before the composite."
+        )
+
+    restored = video_samples.clone()
+    restored[partial] = original.to(
+        device=video_samples.device, dtype=video_samples.dtype
+    )[partial]
+    return restored
+
+
+class vloFeatherVideoLatentMask(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="vloFeatherVideoLatentMask",
+            search_aliases=[
+                "feather video mask",
+                "temporal feather mask",
+                "video mask crossfade",
+                "soften video latent mask",
+            ],
+            display_name="vlo Feather Video Latent Mask",
+            category="latent/mask",
+            description=(
+                "Softens the time edges of a video latent noise mask so inpainted "
+                "footage eases in and out of the surrounding footage instead of "
+                "cutting in. A fractional mask value is a genuine per-token denoise "
+                "strength: MiniMax H3 and LTX run those tokens at sigma = mask * "
+                "sigma, so the model generates the transition. Each pixel is "
+                "feathered on its own, and ramp frames outside the mask borrow the "
+                "nearest masked frame's shape. Run this after any blank latent "
+                "composite; inner and centered ramps also need original_latent."
+            ),
+            inputs=[
+                io.Latent.Input(
+                    "latent",
+                    tooltip=(
+                        "Video latent or joint AV latent that already carries a video "
+                        "noise mask at latent resolution. A nested audio mask is "
+                        "preserved."
+                    ),
+                ),
+                io.Combo.Input(
+                    "mode",
+                    options=list(_FEATHER_MODES),
+                    default="outer",
+                    tooltip=(
+                        "Where the ramp sits relative to the masked frames. 'outer' "
+                        "keeps them solid and decays into the preserved footage, "
+                        "'centered' straddles the edge, and 'inner' keeps the ramp "
+                        "inside so no preserved frame is touched. A run shorter than "
+                        "an inner ramp is never erased; it just peaks lower."
+                    ),
+                ),
+                io.Int.Input(
+                    "lead_ramp",
+                    default=2,
+                    min=0,
+                    max=64,
+                    tooltip=(
+                        "Latent frames of ramp before each masked run. One latent "
+                        "frame is about 4 video frames for MiniMax H3 and 8 for LTX."
+                    ),
+                ),
+                io.Int.Input(
+                    "tail_ramp",
+                    default=2,
+                    min=0,
+                    max=64,
+                    tooltip="Latent frames of ramp after each masked run.",
+                ),
+                io.Int.Input(
+                    "lead_hold",
+                    default=0,
+                    min=0,
+                    max=64,
+                    tooltip=(
+                        "Latent frames of fully solid mask added before each run, "
+                        "ahead of the ramp."
+                    ),
+                ),
+                io.Int.Input(
+                    "tail_hold",
+                    default=0,
+                    min=0,
+                    max=64,
+                    tooltip=(
+                        "Latent frames of fully solid mask added after each run, "
+                        "ahead of the ramp."
+                    ),
+                ),
+                io.Combo.Input(
+                    "curve",
+                    options=list(_FEATHER_CURVES),
+                    default="cosine",
+                    tooltip=(
+                        "Ramp shape. 'cosine' and 'smoothstep' flatten at both ends, so "
+                        "there is no kink where the ramp meets the solid run; 'linear' "
+                        "and 'exponential' leave one."
+                    ),
+                ),
+                io.Float.Input(
+                    "floor",
+                    default=0.0,
+                    min=0.0,
+                    max=1.0,
+                    step=0.01,
+                    advanced=True,
+                    tooltip=(
+                        "Minimum mask value everywhere, applied after the ramp. Above "
+                        "zero this lightly regenerates all of the preserved footage. "
+                        "Zero leaves it untouched."
+                    ),
+                ),
+                io.Latent.Input(
+                    "original_latent",
+                    optional=True,
+                    tooltip=(
+                        "The same latent from before any blank latent composite. Its "
+                        "video is restored wherever the mask is partial, so ramp "
+                        "frames blend toward the footage instead of a blank latent. "
+                        "Required for 'inner' and 'centered' after a composite; "
+                        "'outer' ramps fall outside the cleared region."
+                    ),
+                ),
+            ],
+            outputs=[io.Latent.Output(display_name="latent")],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        latent,
+        mode="outer",
+        lead_ramp=2,
+        tail_ramp=2,
+        lead_hold=0,
+        tail_hold=0,
+        curve="cosine",
+        floor=0.0,
+        original_latent=None,
+    ) -> io.NodeOutput:
+        streams, nested = _latent_streams(latent["samples"])
+        if not nested and getattr(streams[0], "ndim", None) != 5:
+            raise ValueError(
+                "Temporal feathering needs a video latent shaped [B, C, T, H, W]; "
+                f"got {tuple(streams[0].shape)}, which has no time axis."
+            )
+        video_index = _video_stream_index(streams)
+        video_samples = streams[video_index]
+
+        existing_masks = _nested_existing_masks(latent.get("noise_mask"), len(streams))
+        mask = existing_masks[video_index]
+        if not isinstance(mask, torch.Tensor):
+            raise ValueError(
+                "The latent has no video noise mask to feather. Set one first "
+                "(for example with vlo Mask to Latent Mask and SetLatentNoiseMask)."
+            )
+
+        frames, restore_layout = _video_mask_frames(mask, int(video_samples.shape[2]))
+        feathered = _feather_video_mask(
+            frames.to(torch.float32),
+            mode=mode,
+            curve=curve,
+            lead_ramp=int(lead_ramp),
+            tail_ramp=int(tail_ramp),
+            lead_hold=int(lead_hold),
+            tail_hold=int(tail_hold),
+            floor=float(floor),
+        )
+        output_dtype = mask.dtype if mask.is_floating_point() else torch.float32
+        feathered = restore_layout(feathered).to(dtype=output_dtype).contiguous()
+
+        restored = _restore_video_under_ramp(video_samples, feathered, original_latent)
+
+        output = latent.copy()
+        if not nested:
+            output["noise_mask"] = feathered
+            if restored is not None:
+                output["samples"] = restored
+            return io.NodeOutput(output)
+
+        existing_masks[video_index] = feathered
+        for index, stream in enumerate(streams):
+            if existing_masks[index] is None:
+                existing_masks[index] = _default_stream_noise_mask(stream)
+        output["noise_mask"] = comfy.nested_tensor.NestedTensor(existing_masks)
+        if restored is not None:
+            rebuilt = list(streams)
+            rebuilt[video_index] = restored
+            output["samples"] = comfy.nested_tensor.NestedTensor(rebuilt)
+        return io.NodeOutput(output)

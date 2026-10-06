@@ -147,6 +147,43 @@ so ordering alone cannot save them and they would blend toward silence. Connect
 the pre-composite latent to `original_audio_latent` and the node restores the
 original audio underneath the ramp. Outer ramps never need it.
 
+## Video latent mask feathering
+
+`vlo Feather Video Latent Mask` does the same for the video stream. A mask that
+switches from preserved to generated in one latent frame makes inpainted footage
+cut in: motion, lighting and texture jump at the seam. MiniMax H3 and LTX both run
+a masked video token at `sigma = mask * sigma`, so a ramp of fractional values
+has the model generate the transition rather than snapping to it.
+
+Ramps and holds are counted in latent frames, about 4 video frames for MiniMax H3
+and 8 for LTX. The mask must already be at latent resolution, as
+`vlo Mask to Latent Mask` produces it.
+
+Each pixel is feathered on its own along time:
+
+- **outer** ramp frames sit outside the mask and borrow the nearest masked
+  frame's value, so the fade keeps the shape that is fading. One region can stop
+  while another carries on, and only the one that stops gets a ramp.
+- **inner** ramp frames sit inside the mask and are weighted by their distance
+  from its nearest edge. On a binary timeline this matches the audio node's
+  inner ramp. Where the audio node refuses a region shorter than its ramp, this
+  one lets the region peak lower. That matters per pixel, because a moving mask's
+  edge pixels are covered for only a frame or two.
+- **centered** splits the ramp across the edge, as the audio node does.
+
+The ordering rules match the audio node. Run it after any blank latent composite.
+Inner and centered ramps need `original_latent` connected, which restores the
+original video wherever the mask ends up partial.
+
+In vlo, this complements the editor's own temporal mask feather. For a stitched
+generation (context | gap | context), this node softens the seam inside the
+generated clip. The editor's feather then crossfades the generated context
+frames into the footage underneath. With both set to `outer`, keep the editor's
+feather at least as long as this ramp in video frames. Otherwise the editor cuts
+back to the footage while the generated frames are still partly regenerated.
+This node's default of 2 latent frames is about 8 frames on H3, twice the
+editor's 4-frame default for generation masks.
+
 ## Resized video saving
 
 `vlo Save Video` encodes an `IMAGE` batch straight to MP4, MKV or
