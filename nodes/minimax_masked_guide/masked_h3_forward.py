@@ -225,6 +225,8 @@ def masked_forward(model, x, timestep, context, transformer_options={}, minimax_
                                      keyframes=payload.get("keyframes"),
                                      refs=payload.get("refs"))
 
+    transformer_options["minimax_h3_layout"] = layout   # segment spans for attention patches
+
     # model_base passes model_sampling.timestep(sigma) = sigma * 1000
     shift_v = float(transformer_options.get("minimax_h3_sigma_shift_video", model.sigma_shift_video))
     shift_a = float(transformer_options.get("minimax_h3_sigma_shift_audio", model.sigma_shift_audio))
@@ -394,19 +396,19 @@ def masked_forward(model, x, timestep, context, transformer_options={}, minimax_
     blocks_replace = patches_replace.get("dit", {})
     prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(model.blocks), device, transformer_options)
     for i, block in enumerate(model.blocks):
-        comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, block)
+        comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, block, malloc_scope="block")
+        transformer_options["block_index"] = i
         if ("double_block", i) in blocks_replace:
             def block_wrap(args):
                 return {"img": block(args["img"], args["t_emb"], args["mod_segments"], args["rope_freqs"],
-                                     transformer_options=args["transformer_options"])}
+                                     transformer_options=args["transformer_options"], attention=args.get("attention"))}
             h = blocks_replace[("double_block", i)](
                 {"img": h, "t_emb": t_emb, "mod_segments": mod_segments, "rope_freqs": rope_freqs,
-                 "transformer_options": transformer_options},
+                 "layout": layout, "transformer_options": transformer_options},
                 {"original_block": block_wrap})["img"]
         else:
             h = block(h, t_emb, mod_segments, rope_freqs, transformer_options=transformer_options)
-    if prefetch_queue is not None:
-        comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None)
+    comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None, malloc_scope="block")
 
     # target streams are single contiguous segments (audio then video, last two)
     va, vb, _ = next(s for s in layout.segments if s[2] == "video")
@@ -419,7 +421,7 @@ def masked_forward(model, x, timestep, context, transformer_options={}, minimax_
         audio_seg = (aa, ab, rows_to_mod_index(audio_rows_t, 0) // 3)
     else:
         audio_seg = (aa, ab, t_row[seg_t["audio"]])
-    v, a = model.final_layer(h, t_emb, video_seg, audio_seg)
+    v, a = model.final_layer(h, t_emb, video_seg, audio_seg, sigma_v, transformer_options.get("sample_sigmas"), (shift_v, shift_a))
 
     video_out = unpatchify_video(v, latent_t, lat_h // 2, lat_w // 2, model.latents_dim, model.patch_size)
     video_out = video_out[:, :, :orig_t, :orig_h, :orig_w]

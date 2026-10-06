@@ -148,6 +148,9 @@ def tiny_h3_model(seed=0):
             state[key] = torch.randn_like(value) * 0.05
     model.load_state_dict(state)
     model.eval()
+    # ComfyUI loads real checkpoints without grad, and comfy-kitchen's in-place
+    # fused ops refuse any operand that requires it, even under no_grad.
+    model.requires_grad_(False)
     return model
 
 

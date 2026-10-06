@@ -18,11 +18,11 @@ import textwrap
 import torch
 
 
-# Forked against ComfyUI 0.33.0, commit 5f0c4e18cb7e98f0e7c46c2c7ce928d641351e67
+# Forked against ComfyUI 0.37.0, commit 4ef23c34d950eecc37040a21ee1741a49d2e44b1
 # (comfy/ldm/minimax/model.py). Re-verify `tests/test_forward_equivalence.py`
 # after updating ComfyUI.
-TESTED_COMFYUI_COMMIT = "5f0c4e18cb7e98f0e7c46c2c7ce928d641351e67"
-TESTED_COMFYUI_VERSION = "0.33.0"
+TESTED_COMFYUI_COMMIT = "4ef23c34d950eecc37040a21ee1741a49d2e44b1"
+TESTED_COMFYUI_VERSION = "0.37.0"
 
 # sha256 over the source of every core function the fork copies or depends on the
 # exact behaviour of. Symbol probes cannot catch an upstream edit *inside*
@@ -30,7 +30,7 @@ TESTED_COMFYUI_VERSION = "0.33.0"
 # so the source itself is the version check. Regenerate with
 # `COMFYUI_PATH=... python tests/regen_fingerprint.py` after reviewing
 # the upstream diff and re-running the equivalence tests.
-TESTED_SOURCE_FINGERPRINT = "fec8b4e5d7f761bfb8e057dd841719ec6179f234f01abc92de3e731e1bcae100"
+TESTED_SOURCE_FINGERPRINT = "e197eb66dbaf8989a5fd64ed60063d87c2d1b8cb7c74c9939e9b6f8a30b09868"
 
 # (label, dotted path from the H3 module) -- label is hashed too, so reordering
 # or renaming is itself a change.
@@ -155,9 +155,11 @@ def _probe_final_layer_rows(module) -> None:
     import inspect
 
     params = list(inspect.signature(final_layer.forward).parameters)
-    if params[1:] != ["x", "t_emb", "video_seg", "audio_seg"]:
+    # sigma/sample_sigmas/shifts arrived with PDD head banks (PR #15908)
+    expected = ["x", "t_emb", "video_seg", "audio_seg", "sigma", "sample_sigmas", "shifts"]
+    if params[1:] != expected:
         raise RuntimeError(INCOMPATIBLE.format(
-            "FinalLayer.forward takes {} rather than (x, t_emb, video_seg, audio_seg)".format(params[1:])))
+            "FinalLayer.forward takes {} rather than ({})".format(params[1:], ", ".join(expected))))
 
 
 def _probe_wrapper_indexing(module) -> None:
