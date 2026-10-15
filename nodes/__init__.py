@@ -38,6 +38,7 @@ from .loaders import (
     vloMemoryLoadVideoBatch,
 )
 from .logic_nodes import vloGateNone, vloListFanOut, vloLogicNot
+from .mask_grow import _grow_masks, vloGrowMask
 from .minimax import (
     _get_native_minimax_h3_reference_contract,
     vloMiniMaxH3ReferenceToVideoBatch,
@@ -93,6 +94,7 @@ class vloExtension(ComfyExtension):
             vloLatentCompositeMasked,
             vloMaskToLatentMask,
             vloFeatherVideoLatentMask,
+            vloGrowMask,
             vloGateNone,
             vloListFanOut,
             vloLogicNot,

@@ -184,6 +184,19 @@ back to the footage while the generated frames are still partly regenerated.
 This node's default of 2 latent frames is about 8 frames on H3, twice the
 editor's 4-frame default for generation masks.
 
+## Mask growing
+
+`vlo Grow Mask` grows a mask sequence by `expand` pixels with a square kernel.
+It matches stock `Grow Mask` with `tapered_corners` off, but runs as two 1-D max
+pools on the torch device, a chunk of frames at a time. The stock node dilates
+3x3 once per pixel per frame on the CPU, which takes minutes on a long 720p clip.
+
+The kernel is square because latent cells are square. To regenerate every
+latent cell that a masked pixel touches, the mask has to reach a fixed distance
+along both axes, and a round kernel would need about 1.4 times the radius to
+cover the diagonal. One latent cell is a good default: 8 px for Wan and 16 px for
+MiniMax H3, applied at the resolution the video is encoded at.
+
 ## Resized video saving
 
 `vlo Save Video` encodes an `IMAGE` batch straight to MP4, MKV or
