@@ -249,6 +249,136 @@ def test_nearest_resize_keeps_a_mask_binary(nodes_module) -> None:
     assert set(out.unique().tolist()) <= {0.0, 1.0}
 
 
+def _latent_mask(nodes_module, masks, latent_hw, **kwargs) -> torch.Tensor:
+    """A 9-frame mask through a 4x temporal / 16x spatial VAE, latent frame 0."""
+    return nodes_module.vloMaskToLatentMask.execute(
+        latent=_video_latent(3, *latent_hw),
+        vae=_UniformVideoVae(4, spatial_factor=16),
+        masks=masks,
+        **kwargs,
+    ).result[0][0]
+
+
+def test_max_resize_marks_a_cell_the_mask_only_partly_covers(nodes_module) -> None:
+    # The mask reaches 6 px into the second 16 px cell: short of its centre.
+    masks = torch.zeros(9, 16, 64)
+    masks[:, :, :22] = 1.0
+
+    bilinear = _latent_mask(nodes_module, masks, (1, 4))
+    assert bilinear[0].tolist() == [1.0, 0.0, 0.0, 0.0]
+
+    out = _latent_mask(nodes_module, masks, (1, 4), resize_mode="max")
+    assert out[0].tolist() == [1.0, 1.0, 0.0, 0.0]
+
+
+def test_max_resize_never_marks_a_cell_the_mask_misses(nodes_module) -> None:
+    masks = torch.zeros(9, 64, 64)
+    masks[:, 16, 47] = 1.0  # one pixel, in cell (1, 2)
+
+    out = _latent_mask(nodes_module, masks, (4, 4), resize_mode="max")
+
+    expected = torch.zeros(4, 4)
+    expected[1, 2] = 1.0
+    assert torch.equal(out, expected)
+
+
+def test_max_resize_keeps_a_soft_mask_peak(nodes_module) -> None:
+    masks = torch.zeros(9, 32, 32)
+    masks[:, 3, 3] = 0.25
+    masks[:, 4, 4] = 0.6
+
+    out = _latent_mask(nodes_module, masks, (2, 2), resize_mode="max")
+
+    assert out[0, 0] == pytest.approx(0.6)
+    assert out[1, 1] == 0.0
+
+
+def test_max_resize_upsamples_a_smaller_mask_like_nearest(nodes_module) -> None:
+    masks = torch.zeros(9, 2, 2)
+    masks[:, 0, 1] = 1.0
+
+    class _NoCropVae(_UniformVideoVae):
+        crop_input = False
+
+    out = nodes_module.vloMaskToLatentMask.execute(
+        latent=_video_latent(3, 4, 4),
+        vae=_NoCropVae(4, spatial_factor=16),
+        masks=masks,
+        resize_mode="max",
+    ).result[0][0]
+
+    expected = torch.zeros(4, 4)
+    expected[:2, 2:] = 1.0
+    assert torch.equal(out, expected)
+
+
+def _cell_mask(height: int, width: int, *cells: tuple[int, int]) -> torch.Tensor:
+    """A 9-frame pixel mask that fills whole 16 px cells."""
+    masks = torch.zeros(9, height * 16, width * 16)
+    for y, x in cells:
+        masks[:, y * 16:(y + 1) * 16, x * 16:(x + 1) * 16] = 1.0
+    return masks
+
+
+def test_snap_grid_one_leaves_the_latent_mask_unchanged(nodes_module) -> None:
+    masks = torch.rand(9, 96, 96)
+
+    default = _latent_mask(nodes_module, masks, (6, 6), resize_mode="max")
+    snapped = _latent_mask(nodes_module, masks, (6, 6), resize_mode="max", snap_grid=1)
+
+    assert torch.equal(default, snapped)
+
+
+def test_snap_grid_raises_whole_blocks_aligned_to_the_top_left(nodes_module) -> None:
+    out = _latent_mask(
+        nodes_module, _cell_mask(6, 6, (1, 1), (2, 4)), (6, 6), snap_grid=2
+    )
+
+    expected = torch.zeros(6, 6)
+    expected[0:2, 0:2] = 1.0  # (1, 1) sits in the first 2x2 block
+    expected[2:4, 4:6] = 1.0  # (2, 4) is the top-left of its block
+    assert torch.equal(out, expected)
+
+
+def test_snap_grid_accepts_any_block_size(nodes_module) -> None:
+    out = _latent_mask(nodes_module, _cell_mask(6, 6, (4, 2)), (6, 6), snap_grid=3)
+
+    expected = torch.zeros(6, 6)
+    expected[3:6, 0:3] = 1.0
+    assert torch.equal(out, expected)
+
+
+def test_snap_grid_snaps_a_partial_edge_block_over_the_cells_it_has(nodes_module) -> None:
+    out = _latent_mask(nodes_module, _cell_mask(5, 5, (4, 1)), (5, 5), snap_grid=2)
+
+    expected = torch.zeros(5, 5)
+    expected[4, 0:2] = 1.0  # the bottom block row is one cell tall
+    assert torch.equal(out, expected)
+
+
+def test_snap_grid_keeps_each_block_at_its_peak_value(nodes_module) -> None:
+    masks = torch.zeros(9, 64, 64)
+    masks[:, 0:16, 0:16] = 0.3
+    masks[:, 16:32, 16:32] = 0.7
+
+    out = _latent_mask(nodes_module, masks, (4, 4), snap_grid=2)
+
+    assert torch.allclose(out[0:2, 0:2], torch.full((2, 2), 0.7))
+    assert out[2:, :].max() == 0.0 and out[:, 2:].max() == 0.0
+
+
+def test_new_options_default_to_the_previous_behaviour(nodes_module) -> None:
+    inputs = {
+        i.id: i
+        for i in nodes_module.vloMaskToLatentMask.define_schema().inputs
+    }
+
+    assert inputs["resize_mode"].default == "bilinear"
+    assert "max" in inputs["resize_mode"].options
+    assert inputs["snap_grid"].default == 1
+    assert inputs["snap_grid"].min == 1
+
+
 # --- integration with the stock node -----------------------------------------
 
 

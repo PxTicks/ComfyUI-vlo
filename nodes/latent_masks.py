@@ -30,7 +30,7 @@ _MASK_POOLING_METHODS = {
     "mean": lambda frames: frames.mean(dim=0),
     "min": lambda frames: frames.amin(dim=0),
 }
-_MASK_SPATIAL_RESIZE_MODES = ("bilinear", "nearest-exact", "area", "bicubic")
+_MASK_SPATIAL_RESIZE_MODES = ("bilinear", "nearest-exact", "area", "bicubic", "max")
 
 
 def _video_stream_index(streams: list[Any]) -> int:
@@ -268,6 +268,15 @@ def _resize_masks_spatially(
     if masks.shape[-2:] == (height, width):
         return masks
 
+    if mode == "max":
+        # Every pixel lands in some window, so a cell holding any of the mask
+        # takes its peak. Interpolating modes sample only near the cell centre
+        # and can keep a cell the mask partly covers.
+        resized = torch.nn.functional.adaptive_max_pool2d(
+            masks.unsqueeze(1), (height, width)
+        )
+        return resized.squeeze(1)
+
     kwargs = {"align_corners": False} if mode in ("bilinear", "bicubic") else {}
     resized = torch.nn.functional.interpolate(
         masks.unsqueeze(1),
@@ -276,6 +285,24 @@ def _resize_masks_spatially(
         **kwargs,
     )
     return resized.squeeze(1)
+
+
+def _snap_masks_to_grid(masks: torch.Tensor, grid: int) -> torch.Tensor:
+    """Raise every grid x grid block of latent cells to its peak.
+
+    Blocks start at the top-left cell, as DiT patches do (patchify pads the
+    bottom and right), so grid=2 makes each MiniMax H3 token wholly kept or
+    wholly generated. A partial block at the bottom or right edge is snapped
+    over the cells it has.
+    """
+    if grid <= 1:
+        return masks
+    height, width = masks.shape[-2:]
+    blocks = torch.nn.functional.max_pool2d(
+        masks.unsqueeze(1), kernel_size=grid, stride=grid, ceil_mode=True
+    )
+    snapped = blocks.repeat_interleave(grid, dim=-2).repeat_interleave(grid, dim=-1)
+    return snapped[..., :height, :width].squeeze(1)
 
 
 def _latent_streams(samples: Any) -> tuple[list[torch.Tensor], bool]:
@@ -475,7 +502,25 @@ class vloMaskToLatentMask(io.ComfyNode):
                     advanced=True,
                     tooltip=(
                         "How the mask is resized to the latent's height and width. "
-                        "'nearest-exact' keeps hard edges, 'area' averages coverage."
+                        "'nearest-exact' keeps hard edges, 'area' averages coverage, "
+                        "'max' marks a cell wherever it holds any of the mask. "
+                        "'bilinear' samples near each cell's centre, so at 16x it can "
+                        "keep a cell the mask covers up to half of."
+                    ),
+                ),
+                io.Int.Input(
+                    "snap_grid",
+                    default=1,
+                    min=1,
+                    max=64,
+                    advanced=True,
+                    tooltip=(
+                        "Snap the mask outward to blocks of this many latent cells "
+                        "per side, aligned to the top-left. 1 leaves it on the "
+                        "latent grid. 2 matches a DiT that patchifies 2x2 latents "
+                        "(MiniMax H3: 32 px), so no token is part kept and part "
+                        "generated. Pixel size is this times the VAE's spatial "
+                        "compression."
                     ),
                 ),
             ],
@@ -498,6 +543,7 @@ class vloMaskToLatentMask(io.ComfyNode):
         masks,
         pooling_method="max",
         resize_mode="bilinear",
+        snap_grid=1,
     ) -> io.NodeOutput:
         samples = _latent_video_stream(latent.get("samples"))
         if not isinstance(samples, torch.Tensor):
@@ -536,6 +582,10 @@ class vloMaskToLatentMask(io.ComfyNode):
         # 4. Keep the mask a mask: bicubic overshoots, and the sampler blends with
         #    noise_mask unclamped, so out-of-range values extrapolate instead.
         frames = frames.clamp(0.0, 1.0)
+
+        # 5. Snap outward to the model's block grid, so a block the mask reaches
+        #    is generated whole rather than split between kept and generated.
+        frames = _snap_masks_to_grid(frames, int(snap_grid))
         return io.NodeOutput(frames.contiguous())
 
 
