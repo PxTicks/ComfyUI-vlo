@@ -271,6 +271,17 @@ def _ttm_is_minimax_h3(model) -> bool:
     return isinstance(getattr(model, "latent_format", None), MiniMaxH3Video)
 
 
+def _ttm_hold_until(sigmas, step):
+    """The sigma at which a hold that runs while `step < N` stops holding.
+
+    -1 because holding the region *during* the step at sigmas[k] leaves it held at
+    sigmas[k+1]. So to stop holding at step N, the last pinned call is N - 1. This is
+    what makes end_step mean the same thing it means in the TTM reference
+    implementation, where the hold runs while step < end_step.
+    """
+    return float(sigmas[min(step - 1, sigmas.shape[-1] - 1)])
+
+
 class _TTMDenoiseMaskSchedule:
     """Which denoise mask applies at a given sigma, and when TTM stops applying one at all.
 
@@ -390,14 +401,7 @@ class _TTMOuterSample:
         return 1.0 - ttm_mask.to(device=device, dtype=torch.float32)
 
     def _hold_until(self, sigmas, step):
-        """The sigma at which a hold that runs while `step < N` stops holding.
-
-        -1 because holding the region *during* the step at sigmas[k] leaves it held at
-        sigmas[k+1]. So to stop holding at step N, the last pinned call is N - 1. This is
-        what makes end_step mean the same thing it means in the TTM reference
-        implementation, where the hold runs while step < end_step.
-        """
-        return float(sigmas[min(step - 1, sigmas.shape[-1] - 1)])
+        return _ttm_hold_until(sigmas, step)
 
     def _single_stream_plan(self, model, latent_shape, sigmas, device):
         """Skip straight to start_step, starting from a partially-noised reference.

@@ -56,6 +56,7 @@ from .minimax_masked_guide import (
     vloMiniMaxH3PatchMaskedGuides,
 )
 from .registry import REGISTRY
+from .seam_anchor import vloH3SeamAnchor
 from .ttm import vloTimeToMove
 from .video_save import vloSaveVideo
 from .video_nodes import (
@@ -101,6 +102,7 @@ class vloExtension(ComfyExtension):
             vloListFanOut,
             vloLogicNot,
             vloTimeToMove,
+            vloH3SeamAnchor,
         ]
 
 
