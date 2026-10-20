@@ -110,6 +110,34 @@ and is tied to the ComfyUI version it was forked from. See
 [nodes/minimax_masked_guide/README.md](nodes/minimax_masked_guide/README.md) for
 the semantics, the compatibility rules and the experiment protocol.
 
+### MiniMax H3 LoRAs on pruned checkpoints
+
+Pruned H3 checkpoints (`*_pruned_*`) replace the time embedder with an 8-dim
+curve, `adaln_t_table`. A LoRA trained on the full model carries time-conditioning
+updates for the 2688-wide adaln input, which the stock loader cannot apply there:
+it logs `shape '[96768, 8]' is invalid` for every block and drops them. Turbo
+LoRAs lean on those updates.
+
+`vlo MiniMax H3 LoRA Loader` is the model-only LoRA loader with those updates
+refitted to the base's curve. Each becomes a weight and bias delta fitted over
+every point of the curve, to within about 0.01% on the turbo LoRAs tested, and
+merges into the fp32 adaln weights. Nothing runs per step. On a full base, or
+for a LoRA without adaln updates, it is the stock loader.
+
+The fit needs the full model's time embedding, which pruned checkpoints don't
+carry. The first time a pruned base is used, the node range-reads the four
+`time_embedder` tensors (~63 MB per variant, not the whole checkpoint) from
+[Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) at a pinned
+revision. It caches the result in `models/vlo/h3_time_grids/` (folder name
+`vlo_h3_time_grids` in `extra_model_paths.yaml`). The node honours
+`HF_ENDPOINT`, `HF_TOKEN` and `HF_HUB_OFFLINE`, and cache files placed by hand
+are used without fetching. `base: auto` matches the checkpoint's curve to the
+stock fl2va or ref2va one, accepting close finetunes, and refuses anything else.
+
+Pre-converted pruned LoRAs whose adaln bias deltas are all zero misfit the time
+conditioning and are flagged in the log. Load the full-model version of them
+here instead.
+
 ## Audio latent masks
 
 `vlo Set Audio Latent Binary Masks` turns a mask video into a temporal noise mask

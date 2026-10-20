@@ -22,6 +22,7 @@ from .audio_masks import (
     vloFeatherAudioLatentMask,
     vloSetAudioLatentBinaryMasks,
 )
+from .h3_lora import vloMiniMaxH3LoraLoader
 from .latent_masks import (
     _vae_encode_spatial_crop,
     _vae_temporal_groups,
@@ -103,6 +104,7 @@ class vloExtension(ComfyExtension):
             vloLogicNot,
             vloTimeToMove,
             vloH3SeamAnchor,
+            vloMiniMaxH3LoraLoader,
         ]
 
 
