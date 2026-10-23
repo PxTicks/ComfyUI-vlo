@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-vlo"
-description = "Companion nodes for the vlo video editor: in-memory media loaders, ordered batch loaders with a list fan-out, MiniMax H3 reference and masked-guide adapters, audio latent masks and resized video saving."
+description = "Companion nodes for the vlo video editor: in-memory media loaders, ordered batch loaders with a list fan-out, MiniMax H3 reference and masked-guide adapters, SAM3 mask refinement, audio latent masks and resized video saving."
 # vlo reads this to tell users their pack is too old for its workflows
 # (COMFYUI_VLO_MINIMUM_VERSION in vlo's backend/services/comfyui/
 # node_pack_versions.py). Bump it whenever a node or input is added that a vlo

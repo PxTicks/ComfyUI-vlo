@@ -57,6 +57,7 @@ from .minimax_masked_guide import (
     vloMiniMaxH3PatchMaskedGuides,
 )
 from .registry import REGISTRY
+from .sam3_refine import vloSAM3RefineMask
 from .seam_anchor import vloH3SeamAnchor
 from .ttm import vloTimeToMove
 from .video_save import vloSaveVideo
@@ -105,6 +106,7 @@ class vloExtension(ComfyExtension):
             vloTimeToMove,
             vloH3SeamAnchor,
             vloMiniMaxH3LoraLoader,
+            vloSAM3RefineMask,
         ]
 
 

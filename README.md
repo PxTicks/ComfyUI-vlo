@@ -225,6 +225,51 @@ along both axes, and a round kernel would need about 1.4 times the radius to
 cover the diagonal. One latent cell is a good default: 8 px for Wan and 16 px for
 MiniMax H3, applied at the resolution the video is encoded at.
 
+## SAM3 mask refinement
+
+`vlo SAM3 Refine Mask` segments one image from include/exclude points with a
+SAM3 or SAM3.1 checkpoint. Connect a `mask` and the points correct that
+selection instead of starting a new one. Points use the same JSON pixel format
+as core's SAM3 Detect: `[{"x": 120, "y": 80}, ...]`.
+
+Core's `forward_segment` reruns the vision backbone on every call and forces
+multimask for exactly one point, with no fallback otherwise. This node follows
+the interactive policy in Meta's SAM3 and SAM3.1 trackers instead:
+
+- One point keeps the best of the three multimask outputs by predicted IoU.
+- More points keep the single-mask output, unless its stability score is below
+  0.98. Core's port lacks this fallback, so the node adds it.
+- Each decoder pass after the first is fed the previous pass's low-resolution
+  logits, not an upsampled copy. The backbone runs once for all passes.
+
+`mask_selection` can force `single` or `multimask` for comparisons. The default
+`refine_iterations` is 1, as Meta makes one decoder pass per interaction.
+
+A connected mask is binary, so it is mapped to +-10 logits, the scale Meta's
+mask-as-output path uses. That approximates the model's own logits. It is not
+equivalent: real logits are less confident near object edges.
+
+The node copies part of core's `forward_segment` and relies on details of its
+SAM3 prompt encoder and mask decoder. Before running, it checks a fingerprint of
+that source against ComfyUI 0.41.0, the version it was verified with. If
+ComfyUI has changed it, `if_core_changed` decides what happens:
+
+- `native` (default) falls back to core's own `forward_segment`, the call core's
+  SAM3 Detect makes. It still corrects the connected mask. With one decoder pass
+  it differs only in lacking the stability fallback; with more passes the
+  backbone also reruns each time. `mask_selection` is ignored.
+- `stop` raises an error naming the verified version.
+
+The `pipeline` output reports `verified`, `native` or `unverified`, so a
+workflow can tell the user when it is running in the fallback. Each fallback is
+also logged once per process.
+
+After updating ComfyUI, run `tests/test_sam3_refine.py` with
+`VLO_SAM3_CHECKPOINT` set to a checkpoint, then re-pin with
+`tests/regen_fingerprint.py`. To run the copied setup on an unverified version
+anyway, set `VLO_SAM3_REFINE_ALLOW_UNVERIFIED=1`. The pipeline then reports
+`unverified`.
+
 ## Resized video saving
 
 `vlo Save Video` encodes an `IMAGE` batch straight to MP4, MKV or
