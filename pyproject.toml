@@ -5,7 +5,7 @@ description = "Companion nodes for the vlo video editor: in-memory media loaders
 # (COMFYUI_VLO_MINIMUM_VERSION in vlo's backend/services/comfyui/
 # node_pack_versions.py). Bump it whenever a node or input is added that a vlo
 # workflow will rely on, and raise vlo's minimum to match.
-version = "0.3.0"
+version = "0.3.1"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 # Everything the pack imports (torch, numpy, PIL, av, aiohttp) ships with ComfyUI.
