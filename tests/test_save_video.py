@@ -221,6 +221,69 @@ def test_webm_av1_10bit_hdr_with_resampled_audio(video_save, tmp_path) -> None:
         assert audio_stream.sample_rate == 48000
 
 
+def test_mp4_aac_preserves_finite_audio(video_save, tmp_path) -> None:
+    sample_rate = 44100
+    samples = torch.arange(sample_rate) / sample_rate
+    waveform = (0.2 * torch.sin(2 * torch.pi * 440 * samples)).repeat(1, 2, 1)
+    original = waveform.clone()
+    result = _execute(
+        video_save,
+        _frames(count=6),
+        audio={"waveform": waveform, "sample_rate": sample_rate},
+    )
+    _, path = _saved_path(result, tmp_path)
+    with av.open(str(path)) as container:
+        stream = container.streams.audio[0]
+        assert stream.codec_context.name == "aac"
+        assert stream.sample_rate == sample_rate
+        decoded = np.concatenate(
+            [frame.to_ndarray() for frame in container.decode(stream)], axis=1
+        )
+    assert np.isfinite(decoded).all()
+    expected_samples = sample_rate // 4
+    # AAC pads its final frame; the video-duration crop must still be preserved.
+    assert expected_samples <= decoded.shape[1] < expected_samples + 1024
+    np.testing.assert_allclose(
+        decoded[:, 1024:expected_samples],
+        waveform[0, :, 1024:expected_samples].numpy(),
+        atol=0.03,
+    )
+    assert torch.equal(waveform, original)
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), -float("inf")])
+def test_rejects_nonfinite_audio_before_encoding_video(
+    video_save, tmp_path, monkeypatch, invalid
+) -> None:
+    waveform = torch.zeros(1, 2, 44100)
+    waveform[0, 1, 1000] = invalid
+
+    class EncodingGuard:
+        def update(self, _amount):
+            pytest.fail("Invalid audio must be rejected before video encoding")
+
+    monkeypatch.setattr(video_save.comfy.utils, "ProgressBar", lambda _count: EncodingGuard())
+    with pytest.raises(ValueError, match="NaN or infinity in audio"):
+        _execute(
+            video_save,
+            _frames(),
+            audio={"waveform": waveform, "sample_rate": 44100},
+        )
+    assert list((tmp_path / "output" / "video").iterdir()) == []
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("options", [{}, {"width": 128}, {"bit_depth": 10}])
+def test_rejects_nonfinite_pixels_and_removes_partial_file(
+    video_save, tmp_path, invalid, options
+) -> None:
+    images = _frames()
+    images[1, 10, 10, 0] = invalid
+    with pytest.raises(ValueError, match="NaN or infinity in video frame 2"):
+        _execute(video_save, images, **options)
+    assert list((tmp_path / "output" / "video").iterdir()) == []
+
+
 def test_rejects_bad_codec_settings(video_save) -> None:
     with pytest.raises(ValueError, match="crf"):
         _execute(video_save, _frames(), codec="h264", crf=60.0)

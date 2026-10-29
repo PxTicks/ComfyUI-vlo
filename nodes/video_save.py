@@ -171,6 +171,15 @@ def encode_resized_video(
             waveform = audio["waveform"]
             waveform = waveform[0, :, :math.ceil((source_audio_sample_rate / frame_rate) * frame_count)]
             layout = {1: "mono", 2: "stereo", 6: "5.1"}.get(waveform.shape[0], "stereo")
+            waveform = waveform.float().cpu().contiguous().numpy()
+            # AAC rejects non-finite samples with an opaque avcodec error. Check
+            # before encoding video so a failed audio decode is reported directly.
+            if not np.isfinite(waveform).all():
+                raise ValueError(
+                    "vlo Save Video received NaN or infinity in audio. "
+                    "Check upstream generation and audio VAE decoding; "
+                    "the waveform is already invalid before encoding."
+                )
             audio_codec = "libopus" if output_format == Types.VideoContainer.WEBM else "aac"
             audio_stream = output.add_stream(audio_codec, rate=audio_sample_rate, layout=layout)
             if audio_sample_rate != source_audio_sample_rate:
@@ -180,6 +189,14 @@ def encode_resized_video(
             comfy.model_management.throw_exception_if_processing_interrupted()
             # A view: only this frame's crop is converted and copied.
             frame = images[index, crop_y:crop_y + crop_height, crop_x:crop_x + crop_width, :3]
+            # Integer conversion would otherwise silently turn NaNs into damaged
+            # pixels (and only the 16-bit path emits a NumPy warning).
+            if not frame.isfinite().all().item():
+                raise ValueError(
+                    f"vlo Save Video received NaN or infinity in video frame {index + 1}. "
+                    "Check upstream generation and video VAE decoding; "
+                    "the pixels are already invalid before encoding."
+                )
             if is_10bit or scaled:
                 # Preserve float detail until swscale has resized the frame. The
                 # unscaled 8-bit path stays byte-identical to native Save Video.
@@ -202,9 +219,7 @@ def encode_resized_video(
         output.mux(video_stream.encode(None))
 
         if audio_stream is not None:
-            audio_frame = av.AudioFrame.from_ndarray(
-                waveform.float().cpu().contiguous().numpy(), format="fltp", layout=layout
-            )
+            audio_frame = av.AudioFrame.from_ndarray(waveform, format="fltp", layout=layout)
             audio_frame.sample_rate = source_audio_sample_rate
             audio_frame.pts = 0
             frames = [audio_frame] if audio_resampler is None else audio_resampler.resample(audio_frame)
